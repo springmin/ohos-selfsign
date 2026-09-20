@@ -212,7 +212,7 @@ fn align_up(v: u64, a: u64) -> u64 {
 }
 
 /* ─────────────────── ELF 预清洗/标准化 (非签名必需) ─────────────────── */
-fn parse_elf_header(elf: &[u8]) -> Result<(u64, u16, u16), String> {
+fn parse_elf_header(elf: &[u8]) -> Result<(u64, u16, u16, u16), String> {
     if elf.len() < 64 || &elf[0..4] != b"\x7fELF" || elf[4] != 2 {
         return Err("not ELF64".to_string());
     }
@@ -220,13 +220,16 @@ fn parse_elf_header(elf: &[u8]) -> Result<(u64, u16, u16), String> {
     let e_shentsize = read_u16(elf, E_SHENTSIZE);
     let e_shnum = read_u16(elf, E_SHNUM);
     let e_shstrndx = read_u16(elf, E_SHSTRNDX);
-    if e_shentsize != 64 || e_shoff == 0 || e_shnum == 0 || e_shstrndx >= e_shnum {
+    // e_shentsize 至少要能容纳标准的 64 字节条目；更大的条目（带扩展字段的
+    // ELF）是合法的，读取时必须按实际步长走，不能假设固定 64。
+    if e_shentsize < 64 || e_shoff == 0 || e_shnum == 0 || e_shstrndx >= e_shnum {
         return Err("ELF has no usable section header table".to_string());
     }
-    if e_shoff > elf.len() as u64 || (e_shnum as u64) > (elf.len() as u64 - e_shoff) / 64 {
+    let sh_size = e_shentsize as u64;
+    if e_shoff > elf.len() as u64 || (e_shnum as u64) > (elf.len() as u64 - e_shoff) / sh_size {
         return Err("section header table out of bounds".to_string());
     }
-    Ok((e_shoff, e_shnum, e_shstrndx))
+    Ok((e_shoff, e_shnum, e_shstrndx, e_shentsize))
 }
 
 fn find_section_by_name(
@@ -234,17 +237,19 @@ fn find_section_by_name(
     e_shoff: u64,
     e_shnum: u16,
     e_shstrndx: u16,
+    e_shentsize: u16,
     name: &[u8],
 ) -> i64 {
     let name_len = name.len();
-    let shstr_e = e_shoff + (e_shstrndx as u64) * 64;
+    let entsz = e_shentsize as u64;
+    let shstr_e = e_shoff + (e_shstrndx as u64) * entsz;
     let shstr_off = read_u64(elf, shstr_e as usize + 24);
     let shstr_sz = read_u64(elf, shstr_e as usize + 32);
     if shstr_off > elf.len() as u64 || shstr_sz > elf.len() as u64 - shstr_off {
         return -1;
     }
     for i in 0..e_shnum {
-        let e = e_shoff + (i as u64) * 64;
+        let e = e_shoff + (i as u64) * entsz;
         let name_off = read_u32(elf, e as usize);
         if (name_off as u64) + (name_len as u64) <= shstr_sz {
             let start = (shstr_off + name_off as u64) as usize;
@@ -258,8 +263,15 @@ fn find_section_by_name(
 
 fn has_codesign_section(elf: &[u8]) -> bool {
     match parse_elf_header(elf) {
-        Ok((e_shoff, e_shnum, e_shstrndx)) => {
-            find_section_by_name(elf, e_shoff, e_shnum, e_shstrndx, CODESIGN_NAME) >= 0
+        Ok((e_shoff, e_shnum, e_shstrndx, e_shentsize)) => {
+            find_section_by_name(
+                elf,
+                e_shoff,
+                e_shnum,
+                e_shstrndx,
+                e_shentsize,
+                CODESIGN_NAME,
+            ) >= 0
         }
         Err(_) => false,
     }
@@ -275,15 +287,23 @@ fn new_shstrndx(old_shstrndx: u16, cs_idx: usize) -> u16 {
 
 fn strip_codesign(buf: &[u8]) -> Result<(bool, Vec<u8>), String> {
     let elf = buf.to_vec();
-    let (e_shoff, e_shnum, e_shstrndx) = parse_elf_header(&elf)?;
+    let (e_shoff, e_shnum, e_shstrndx, e_shentsize) = parse_elf_header(&elf)?;
+    let entsz = e_shentsize as usize;
 
-    let cs_entry_off = find_section_by_name(&elf, e_shoff, e_shnum, e_shstrndx, CODESIGN_NAME);
+    let cs_entry_off = find_section_by_name(
+        &elf,
+        e_shoff,
+        e_shnum,
+        e_shstrndx,
+        e_shentsize,
+        CODESIGN_NAME,
+    );
     if cs_entry_off < 0 {
         return Ok((false, elf));
     }
-    let cs_idx = ((cs_entry_off as u64 - e_shoff) / 64) as usize;
+    let cs_idx = ((cs_entry_off as u64 - e_shoff) / e_shentsize as u64) as usize;
 
-    let shstr_e = e_shoff + (e_shstrndx as u64) * 64;
+    let shstr_e = e_shoff + (e_shstrndx as u64) * e_shentsize as u64;
     let shstr_off = read_u64(&elf, shstr_e as usize + 24);
     let shstr_sz = read_u64(&elf, shstr_e as usize + 32);
     if shstr_off > elf.len() as u64 || shstr_sz > elf.len() as u64 - shstr_off {
@@ -303,13 +323,13 @@ fn strip_codesign(buf: &[u8]) -> Result<(bool, Vec<u8>), String> {
 
     // 3. 新 SHT = 旧 SHT 去掉 cs_idx 条目
     let new_shnum = e_shnum - 1;
-    let mut new_sht = Vec::with_capacity(new_shnum as usize * 64);
+    let mut new_sht = Vec::with_capacity(new_shnum as usize * entsz);
     for i in 0..e_shnum {
         if i as usize == cs_idx {
             continue;
         }
-        let e = e_shoff as usize + i as usize * 64;
-        new_sht.extend_from_slice(&elf[e..e + 64]);
+        let e = e_shoff as usize + i as usize * entsz;
+        new_sht.extend_from_slice(&elf[e..e + entsz]);
     }
 
     // 4. 截断到 .codesign 段文件偏移, 依次追加 新shstrtab / 8B对齐 新SHT
@@ -317,15 +337,15 @@ fn strip_codesign(buf: &[u8]) -> Result<(bool, Vec<u8>), String> {
     let keep_len = (cs_sec_off as usize).min(elf.len());
     let new_shstr_off = keep_len;
     let new_sht_off = align_up((new_shstr_off + new_shstr_sz) as u64, 8) as usize;
-    let new_total = new_sht_off + new_shnum as usize * 64;
+    let new_total = new_sht_off + new_shnum as usize * entsz;
 
     let mut out = vec![0u8; new_total];
     out[0..keep_len].copy_from_slice(&elf[0..keep_len]);
     out[new_shstr_off..new_shstr_off + new_shstr_sz].copy_from_slice(&new_shstr);
-    out[new_sht_off..new_sht_off + new_shnum as usize * 64].copy_from_slice(&new_sht);
+    out[new_sht_off..new_sht_off + new_shnum as usize * entsz].copy_from_slice(&new_sht);
 
     // 5. 重写 shstrtab 条目
-    let shstr_entry_off_in_new = new_shstrndx(e_shstrndx, cs_idx) as usize * 64;
+    let shstr_entry_off_in_new = new_shstrndx(e_shstrndx, cs_idx) as usize * entsz;
     write_u64(
         &mut out,
         new_sht_off + shstr_entry_off_in_new + 24,
@@ -339,7 +359,7 @@ fn strip_codesign(buf: &[u8]) -> Result<(bool, Vec<u8>), String> {
 
     // 6. 所有 sh_name > cs_name_off 的段名偏移整体前移 cs_name_len
     for i in 0..new_shnum as usize {
-        let e = new_sht_off + i * 64;
+        let e = new_sht_off + i * entsz;
         let noff = read_u32(&out, e);
         if noff > cs_name_off {
             write_u32(&mut out, e, noff - cs_name_len as u32);
@@ -358,9 +378,10 @@ fn strip_codesign(buf: &[u8]) -> Result<(bool, Vec<u8>), String> {
 
 /* ─────────────────── 签名必需的算法核心 ─────────────────── */
 fn inject_codesign_section(elf: &[u8]) -> Result<(Vec<u8>, usize), String> {
-    let (e_shoff, e_shnum, e_shstrndx) = parse_elf_header(elf)?;
+    let (e_shoff, e_shnum, e_shstrndx, e_shentsize) = parse_elf_header(elf)?;
+    let entsz = e_shentsize as usize;
 
-    let shstr_e = e_shoff + (e_shstrndx as u64) * 64;
+    let shstr_e = e_shoff + (e_shstrndx as u64) * e_shentsize as u64;
     let shstr_off = read_u64(elf, shstr_e as usize + 24);
     let shstr_sz = read_u64(elf, shstr_e as usize + 32);
     if shstr_off > elf.len() as u64 || shstr_sz > elf.len() as u64 - shstr_off {
@@ -368,9 +389,9 @@ fn inject_codesign_section(elf: &[u8]) -> Result<(Vec<u8>, usize), String> {
     }
 
     // 1. cur_end: SHT 末尾与各段 off+sz 的最大值 (SHT_NOBITS=8 不占文件)
-    let mut cur_end = e_shoff + (e_shnum as u64) * 64;
+    let mut cur_end = e_shoff + (e_shnum as u64) * entsz as u64;
     for i in 0..e_shnum {
-        let e = e_shoff + (i as u64) * 64;
+        let e = e_shoff + (i as u64) * entsz as u64;
         let sh_type = read_u32(elf, e as usize + 4);
         let off = read_u64(elf, e as usize + 24);
         let sz = if sh_type == 8 {
@@ -382,6 +403,11 @@ fn inject_codesign_section(elf: &[u8]) -> Result<(Vec<u8>, usize), String> {
             cur_end = off + sz;
         }
     }
+    // 末尾可能存在不被任何段覆盖的数据（例如 Bun 的 standalone module graph
+    // 就追加在最后一个段之后）。若不把这些字节计入 cur_end，cs_off 会落在
+    // 数据中间，下面的拷贝按 cs_off 截断时会把它整段丢掉。把文件真实末尾
+    // 纳入后再对齐，保证尾部数据一并保留。
+    let cur_end = cur_end.max(elf.len() as u64);
     let cs_off = align_up(cur_end, PAGE_SIZE as u64) as usize;
 
     // 2. 新 shstrtab = 旧 + ".codesign\0"
@@ -395,7 +421,7 @@ fn inject_codesign_section(elf: &[u8]) -> Result<(Vec<u8>, usize), String> {
     let new_shstr_off = cs_off + PAGE_SIZE;
     let new_sht_off = align_up((new_shstr_off + new_shstr_sz) as u64, 8) as usize;
     let new_shnum = e_shnum + 1;
-    let new_total = new_sht_off + new_shnum as usize * 64;
+    let new_total = new_sht_off + new_shnum as usize * entsz;
 
     let mut buf = vec![0u8; new_total];
     // 4. 拷贝原内容: 只拷到 cs_off
@@ -404,11 +430,11 @@ fn inject_codesign_section(elf: &[u8]) -> Result<(Vec<u8>, usize), String> {
 
     buf[new_shstr_off..new_shstr_off + new_shstr_sz].copy_from_slice(&new_shstr);
     let sht_start = e_shoff as usize;
-    buf[new_sht_off..new_sht_off + e_shnum as usize * 64]
-        .copy_from_slice(&elf[sht_start..sht_start + e_shnum as usize * 64]);
+    buf[new_sht_off..new_sht_off + e_shnum as usize * entsz]
+        .copy_from_slice(&elf[sht_start..sht_start + e_shnum as usize * entsz]);
 
-    // .codesign 段条目 (64B)
-    let cs_e = new_sht_off + e_shnum as usize * 64;
+    // .codesign 段条目
+    let cs_e = new_sht_off + e_shnum as usize * entsz;
     write_u32(&mut buf, cs_e, cs_shname); // sh_name
     write_u32(&mut buf, cs_e + 4, 1); // sh_type = SHT_PROGBITS
     write_u64(&mut buf, cs_e + 24, cs_off as u64); // sh_offset
@@ -416,7 +442,7 @@ fn inject_codesign_section(elf: &[u8]) -> Result<(Vec<u8>, usize), String> {
     write_u64(&mut buf, cs_e + 48, PAGE_SIZE as u64); // sh_addralign
 
     // 更新 shstrtab 条目偏移/大小
-    let shstr_e_new = new_sht_off + e_shstrndx as usize * 64;
+    let shstr_e_new = new_sht_off + e_shstrndx as usize * entsz;
     write_u64(&mut buf, shstr_e_new + 24, new_shstr_off as u64);
     write_u64(&mut buf, shstr_e_new + 32, new_shstr_sz as u64);
 
