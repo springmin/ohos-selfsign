@@ -24,6 +24,9 @@ rustc -O selfsign.rs -o selfsign
 # Go 版（需编译）
 go build -o selfsign selfsign.go
 ./selfsign <input_elf> [output_elf] [--force] [--strip]
+
+# C# 版（需 .NET 10+ SDK；文件式运行）
+dotnet run selfsign.cs -- <input_elf> [output_elf] [--force] [--strip] [--check]
 ```
 
 参数说明：
@@ -53,6 +56,7 @@ go build -o selfsign selfsign.go
 | `selfsign.js` | JavaScript (Node.js) 实现，仅用内置模块 crypto，零第三方依赖 |
 | `selfsign.rs` | Rust 实现，仅用标准库，自带 SHA-256，零第三方依赖 |
 | `selfsign.go` | Go 实现，仅用标准库 crypto/sha256，零第三方依赖 |
+| `selfsign.cs` | C# 实现，仅用 BCL（System.Security.Cryptography），零第三方依赖 |
 
 各版本对同一 ELF 输入产生字节级一致的签名结果。
 
