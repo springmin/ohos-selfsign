@@ -315,47 +315,59 @@ def inject_codesign_section(elf: bytes) -> tuple[bytes, int]:
     return bytes(buf), cs_off
 
 
-def merkle_root_hash(data: bytes, cs_off: int, cs_len: int) -> bytes:
-    """fs-verity Merkle 树根哈希 (签名必需).
+def merkle_root_hash_and_tree(data: bytes, cs_off: int,
+                              cs_len: int) -> tuple[bytes, bytes]:
+    """fs-verity Merkle 树根哈希 + 中间层哈希 (签名必需).
 
     与上游 merkle_tree_builder.cpp::RunHashTask 等价:
     - 叶层: 每 4096B 一页 SHA-256, 末页零填充; 段所在页
       [cs_off/PAGE, ceil((cs_off+cs_len)/PAGE)) 的叶哈希全置 0
     - 上推: 每页打包 128 个 32B 哈希再 SHA-256, 末页零填充, 直到
       整层 packed <= 4096, 补零后哈希即根
+
+    返回 (根哈希, 树中间层字节): 中间层从紧贴叶层的一层开始逐层向上,
+    每层的 32B 哈希顺序拼接; 单页文件没有中间层.
     """
     if len(data) == 0:
-        return sha256(bytes(PAGE_SIZE))
+        return sha256(bytes(PAGE_SIZE)), b""
 
     npages = (len(data) + PAGE_SIZE - 1) // PAGE_SIZE
     cs_page_begin = cs_off // PAGE_SIZE
     cs_page_end = (cs_off + cs_len + PAGE_SIZE - 1) // PAGE_SIZE
 
-    hashes = bytearray()
+    leaves = bytearray()
     for i in range(npages):
         if cs_len > 0 and cs_page_begin <= i < cs_page_end:
-            hashes += bytes(HASH_OUT)  # 段所在页: 叶哈希置0
+            leaves += bytes(HASH_OUT)  # 段所在页: 叶哈希置0
             continue
         page = data[i * PAGE_SIZE: (i + 1) * PAGE_SIZE]
         if len(page) < PAGE_SIZE:
             page = page + bytes(PAGE_SIZE - len(page))  # 末页补0
-        hashes += sha256(page)
+        leaves += sha256(page)
 
     if npages == 1:
-        return bytes(hashes[:HASH_OUT])
+        return bytes(leaves[:HASH_OUT]), b""
 
-    cur = bytes(hashes)
-    while True:
-        if len(cur) <= PAGE_SIZE:
-            page = cur + bytes(PAGE_SIZE - len(cur))
-            return sha256(page)
+    # 逐层上推; levels[0] = 叶层, 最后一层是根所在层
+    levels = [bytes(leaves)]
+    while len(levels[-1]) > PAGE_SIZE:
+        prev = levels[-1]
         nxt = bytearray()
-        for i in range(0, len(cur), PAGE_SIZE):
-            page = cur[i: i + PAGE_SIZE]
+        for i in range(0, len(prev), PAGE_SIZE):
+            page = prev[i: i + PAGE_SIZE]
             if len(page) < PAGE_SIZE:
                 page = page + bytes(PAGE_SIZE - len(page))
             nxt += sha256(page)
-        cur = bytes(nxt)
+        levels.append(bytes(nxt))
+
+    root = sha256(levels[-1] + bytes(PAGE_SIZE - len(levels[-1])))
+
+    # 树中间层 = 叶层与根所在层之间的所有层, 从下往上拼接
+    tree = bytearray()
+    if len(levels) > 2:
+        for level in levels[1:-1]:
+            tree += level
+    return root, bytes(tree)
 
 
 def build_descriptor(sign_size: int, file_size: int, root: bytes,
@@ -415,8 +427,8 @@ def sign_elf(elf: bytes, force: bool) -> bytes:
     tmp, cs_off = inject_codesign_section(bytes(buf))
     file_size = len(tmp)
 
-    # 2. merkle 根哈希: 跳过 [cs_off, cs_off+4096)
-    root = merkle_root_hash(tmp, cs_off, PAGE_SIZE)
+    # 2. merkle 根哈希 + 中间层哈希: 跳过 [cs_off, cs_off+4096)
+    root, tree_bytes = merkle_root_hash_and_tree(tmp, cs_off, PAGE_SIZE)
 
     # 3/4. descriptor(signSize=0) 用于摘要
     desc_for_digest = build_descriptor(0, file_size, root, FLAG_SELF_SIGN)
@@ -433,9 +445,15 @@ def sign_elf(elf: bytes, force: bool) -> bytes:
     payload += desc_on_disk
     payload += signature
 
-    # 8. 原地写入段内
+    # 8. 原地写入段内: payload 之后写 merkle 树中间层哈希
+    #    (与 binary-sign-tool 一致; 段 4KB 放不下时从叶侧截断)
     tmp = bytearray(tmp)
     tmp[cs_off: cs_off + len(payload)] = payload
+    tree_start = cs_off + len(payload)
+    tree_max = PAGE_SIZE - len(payload)
+    if tree_bytes:
+        n = min(len(tree_bytes), tree_max)
+        tmp[tree_start: tree_start + n] = tree_bytes[:n]
     return bytes(tmp)
 
 

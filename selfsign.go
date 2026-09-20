@@ -293,19 +293,22 @@ func injectCodesignSection(elf []byte) ([]byte, int, error) {
 	return buf, csOff, nil
 }
 
-func merkleRootHash(data []byte, csOff, csLen int) [32]byte {
+func merkleRootHashAndTree(data []byte, csOff, csLen int) ([32]byte, []byte) {
+	// fs-verity Merkle 树根哈希 + 中间层哈希.
+	// tree 从紧贴叶层的一层开始逐层向上, 每层的 32B 哈希顺序拼接;
+	// 单页文件没有中间层.
 	if len(data) == 0 {
-		return doSha256(make([]byte, pageSize))
+		return doSha256(make([]byte, pageSize)), nil
 	}
 
 	npages := (len(data) + pageSize - 1) / pageSize
 	csPageBegin := csOff / pageSize
 	csPageEnd := (csOff + csLen + pageSize - 1) / pageSize
 
-	hashes := make([]byte, 0, npages*hashOut)
+	leaves := make([]byte, 0, npages*hashOut)
 	for i := 0; i < npages; i++ {
 		if csLen > 0 && i >= csPageBegin && i < csPageEnd {
-			hashes = append(hashes, make([]byte, hashOut)...) // 段所在页: 叶哈希置 0
+			leaves = append(leaves, make([]byte, hashOut)...) // 段所在页: 叶哈希置 0
 			continue
 		}
 		page := make([]byte, pageSize)
@@ -316,38 +319,47 @@ func merkleRootHash(data []byte, csOff, csLen int) [32]byte {
 		}
 		copy(page, data[off:off+n])
 		sum := doSha256(page)
-		hashes = append(hashes, sum[:]...)
+		leaves = append(leaves, sum[:]...)
 	}
 
 	if npages == 1 {
 		var root [32]byte
-		copy(root[:], hashes[:hashOut])
-		return root
+		copy(root[:], leaves[:hashOut])
+		return root, nil
 	}
 
-	cur := hashes
-	for {
-		packed := len(cur)
-		if packed <= pageSize {
-			page := make([]byte, pageSize)
-			copy(page, cur)
-			return doSha256(page)
-		}
-		nextPages := (packed + pageSize - 1) / pageSize
+	// 逐层上推; levels[0] = 叶层, 最后一层是根所在层
+	levels := [][]byte{leaves}
+	for len(levels[len(levels)-1]) > pageSize {
+		prev := levels[len(levels)-1]
+		nextPages := (len(prev) + pageSize - 1) / pageSize
 		next := make([]byte, 0, nextPages*hashOut)
 		for i := 0; i < nextPages; i++ {
 			page := make([]byte, pageSize)
 			off := i * pageSize
 			n := pageSize
-			if off+pageSize > packed {
-				n = packed - off
+			if off+pageSize > len(prev) {
+				n = len(prev) - off
 			}
-			copy(page, cur[off:off+n])
+			copy(page, prev[off:off+n])
 			sum := doSha256(page)
 			next = append(next, sum[:]...)
 		}
-		cur = next
+		levels = append(levels, next)
 	}
+
+	rootPage := make([]byte, pageSize)
+	copy(rootPage, levels[len(levels)-1])
+	root := doSha256(rootPage)
+
+	// 树中间层 = 叶层与根所在层之间的所有层, 从下往上拼接
+	var tree []byte
+	if len(levels) > 2 {
+		for _, lv := range levels[1 : len(levels)-1] {
+			tree = append(tree, lv...)
+		}
+	}
+	return root, tree
 }
 
 func buildDescriptor(signSize uint32, fileSize uint64, root [32]byte, flags uint32) [descSize]byte {
@@ -390,8 +402,8 @@ func signElf(elf []byte, force bool) ([]byte, error) {
 	}
 	fileSize := uint64(len(tmp0))
 
-	// 2. merkle 根哈希
-	root := merkleRootHash(tmp0, csOff, pageSize)
+	// 2. merkle 根哈希 + 中间层哈希
+	root, treeBytes := merkleRootHashAndTree(tmp0, csOff, pageSize)
 
 	// 3/4. descriptor(signSize=0) 用于摘要
 	descForDigest := buildDescriptor(0, fileSize, root, flagSelfSign)
@@ -407,9 +419,19 @@ func signElf(elf []byte, force bool) ([]byte, error) {
 	copy(payload[8:], descOnDisk[:])
 	copy(payload[8+descSize:], signature[:])
 
-	// 8. 原地写入段内
+	// 8. 原地写入段内: payload 之后写 merkle 树中间层哈希
+	//    (与 binary-sign-tool 一致; 段 4KB 放不下时从叶侧截断)
 	tmp := tmp0
 	copy(tmp[csOff:], payload)
+	treeStart := csOff + len(payload)
+	treeMax := pageSize - len(payload)
+	if len(treeBytes) > 0 {
+		n := len(treeBytes)
+		if n > treeMax {
+			n = treeMax
+		}
+		copy(tmp[treeStart:treeStart+n], treeBytes[:n])
+	}
 	return tmp, nil
 }
 

@@ -427,19 +427,33 @@ fn inject_codesign_section(elf: &[u8]) -> Result<(Vec<u8>, usize), String> {
     Ok((buf, cs_off))
 }
 
-fn merkle_root_hash(data: &[u8], cs_off: usize, cs_len: usize) -> [u8; 32] {
+/// fs-verity Merkle 树根哈希 + 中间层哈希 (签名必需).
+///
+/// 与上游 merkle_tree_builder.cpp::RunHashTask 等价:
+/// - 叶层: 每 4096B 一页 SHA-256, 末页零填充; 段所在页
+///   [cs_off/PAGE, ceil((cs_off+cs_len)/PAGE)) 的叶哈希全置 0
+/// - 上推: 每页打包 128 个 32B 哈希再 SHA-256, 末页零填充, 直到
+///   整层 packed <= 4096, 补零后哈希即根
+///
+/// 返回 (根哈希, 树中间层字节): 中间层从紧贴叶层的一层开始逐层向上,
+/// 每层的 32B 哈希顺序拼接; 单页文件没有中间层.
+fn merkle_root_hash_and_tree(
+    data: &[u8],
+    cs_off: usize,
+    cs_len: usize,
+) -> ([u8; 32], Vec<u8>) {
     if data.is_empty() {
-        return sha256(&[0u8; PAGE_SIZE]);
+        return (sha256(&[0u8; PAGE_SIZE]), Vec::new());
     }
 
     let npages = data.len().div_ceil(PAGE_SIZE);
     let cs_page_begin = cs_off / PAGE_SIZE;
     let cs_page_end = (cs_off + cs_len).div_ceil(PAGE_SIZE);
 
-    let mut hashes = Vec::with_capacity(npages * HASH_OUT);
+    let mut leaves = Vec::with_capacity(npages * HASH_OUT);
     for i in 0..npages {
         if cs_len > 0 && i >= cs_page_begin && i < cs_page_end {
-            hashes.extend_from_slice(&[0u8; HASH_OUT]); // 段所在页: 叶哈希置 0
+            leaves.extend_from_slice(&[0u8; HASH_OUT]); // 段所在页: 叶哈希置 0
             continue;
         }
         let mut page = vec![0u8; PAGE_SIZE];
@@ -450,38 +464,53 @@ fn merkle_root_hash(data: &[u8], cs_off: usize, cs_len: usize) -> [u8; 32] {
             data.len() - off
         };
         page[0..n].copy_from_slice(&data[off..off + n]);
-        hashes.extend_from_slice(&sha256(&page));
+        leaves.extend_from_slice(&sha256(&page));
     }
 
     if npages == 1 {
         let mut root = [0u8; 32];
-        root.copy_from_slice(&hashes[0..HASH_OUT]);
-        return root;
+        root.copy_from_slice(&leaves[0..HASH_OUT]);
+        return (root, Vec::new());
     }
 
-    let mut cur = hashes;
+    // 逐层上推; levels[0] = 叶层, 最后一层是根所在层.
+    let mut levels: Vec<Vec<u8>> = vec![leaves];
     loop {
-        let packed = cur.len();
+        let packed = levels.last().unwrap().len();
         if packed <= PAGE_SIZE {
-            let mut page = vec![0u8; PAGE_SIZE];
-            page[0..packed].copy_from_slice(&cur);
-            return sha256(&page);
+            break;
         }
         let next_pages = packed.div_ceil(PAGE_SIZE);
         let mut next = Vec::with_capacity(next_pages * HASH_OUT);
-        for i in 0..next_pages {
-            let mut page = vec![0u8; PAGE_SIZE];
-            let off = i * PAGE_SIZE;
-            let n = if off + PAGE_SIZE <= packed {
-                PAGE_SIZE
-            } else {
-                packed - off
-            };
-            page[0..n].copy_from_slice(&cur[off..off + n]);
-            next.extend_from_slice(&sha256(&page));
+        {
+            let prev = levels.last().unwrap();
+            for i in 0..next_pages {
+                let mut page = vec![0u8; PAGE_SIZE];
+                let off = i * PAGE_SIZE;
+                let n = if off + PAGE_SIZE <= packed {
+                    PAGE_SIZE
+                } else {
+                    packed - off
+                };
+                page[0..n].copy_from_slice(&prev[off..off + n]);
+                next.extend_from_slice(&sha256(&page));
+            }
         }
-        cur = next;
+        levels.push(next);
     }
+
+    let mut root_page = vec![0u8; PAGE_SIZE];
+    root_page[0..levels.last().unwrap().len()].copy_from_slice(levels.last().unwrap());
+    let root = sha256(&root_page);
+
+    // 树中间层 = 叶层与根所在层之间的所有层, 从下往上拼接.
+    let mut tree = Vec::new();
+    if levels.len() > 2 {
+        for level in &levels[1..levels.len() - 1] {
+            tree.extend_from_slice(level);
+        }
+    }
+    (root, tree)
 }
 
 fn build_descriptor(
@@ -520,8 +549,8 @@ fn sign_elf(elf: &[u8], force: bool) -> Result<Vec<u8>, String> {
     let (tmp0, cs_off) = inject_codesign_section(&buf)?;
     let file_size = tmp0.len() as u64;
 
-    // 2. merkle 根哈希
-    let root = merkle_root_hash(&tmp0, cs_off, PAGE_SIZE);
+    // 2. merkle 根哈希 + 中间层哈希
+    let (root, tree_bytes) = merkle_root_hash_and_tree(&tmp0, cs_off, PAGE_SIZE);
 
     // 3/4. descriptor(signSize=0) 用于摘要
     let desc_for_digest = build_descriptor(0, file_size, &root, FLAG_SELF_SIGN);
@@ -537,9 +566,16 @@ fn sign_elf(elf: &[u8], force: bool) -> Result<Vec<u8>, String> {
     payload[8..8 + DESC_SIZE].copy_from_slice(&desc_on_disk);
     payload[8 + DESC_SIZE..8 + DESC_SIZE + HASH_OUT].copy_from_slice(&signature);
 
-    // 8. 原地写入段内
+    // 8. 原地写入段内: payload 之后写 merkle 树中间层哈希
+    //    (与 binary-sign-tool 一致; 段 4KB 放不下时从叶侧截断)
     let mut tmp = tmp0;
     tmp[cs_off..cs_off + payload.len()].copy_from_slice(&payload);
+    let tree_start = cs_off + payload.len();
+    let tree_max = PAGE_SIZE - payload.len();
+    if !tree_bytes.is_empty() {
+        let n = tree_bytes.len().min(tree_max);
+        tmp[tree_start..tree_start + n].copy_from_slice(&tree_bytes[..n]);
+    }
     Ok(tmp)
 }
 

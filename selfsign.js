@@ -287,49 +287,59 @@ function injectCodesignSection(elf) {
   return { out: buf, cs_off };
 }
 
-function merkleRootHash(data, cs_off, cs_len) {
-  // fs-verity Merkle 树根哈希
+function merkleRootHashAndTree(data, cs_off, cs_len) {
+  // fs-verity Merkle 树根哈希 + 中间层哈希.
+  // 返回 {root, tree}: tree 从紧贴叶层的一层开始逐层向上, 每层的
+  // 32B 哈希顺序拼接; 单页文件没有中间层.
   if (data.length === 0) {
-    return sha256(Buffer.alloc(PAGE_SIZE));
+    return { root: sha256(Buffer.alloc(PAGE_SIZE)), tree: Buffer.alloc(0) };
   }
 
   const npages = Math.ceil(data.length / PAGE_SIZE);
   const cs_page_begin = Math.floor(cs_off / PAGE_SIZE);
   const cs_page_end = Math.ceil((cs_off + cs_len) / PAGE_SIZE);
 
-  const hashes = [];
+  const leaves = [];
   for (let i = 0; i < npages; i++) {
     if (cs_len > 0 && cs_page_begin <= i && i < cs_page_end) {
-      hashes.push(Buffer.alloc(HASH_OUT)); // 段所在页: 叶哈希置 0
+      leaves.push(Buffer.alloc(HASH_OUT)); // 段所在页: 叶哈希置 0
       continue;
     }
     let page = data.slice(i * PAGE_SIZE, (i + 1) * PAGE_SIZE);
     if (page.length < PAGE_SIZE) {
       page = Buffer.concat([page, Buffer.alloc(PAGE_SIZE - page.length)]);
     }
-    hashes.push(sha256(page));
+    leaves.push(sha256(page));
   }
 
   if (npages === 1) {
-    return Buffer.from(hashes[0]);
+    return { root: Buffer.from(leaves[0]), tree: Buffer.alloc(0) };
   }
 
-  let cur = Buffer.concat(hashes);
-  for (;;) {
-    if (cur.length <= PAGE_SIZE) {
-      const page = Buffer.concat([cur, Buffer.alloc(PAGE_SIZE - cur.length)]);
-      return sha256(page);
-    }
+  // 逐层上推; levels[0] = 叶层, 最后一层是根所在层
+  const levels = [Buffer.concat(leaves)];
+  while (levels[levels.length - 1].length > PAGE_SIZE) {
+    const prev = levels[levels.length - 1];
     const nxt = [];
-    for (let i = 0; i < cur.length; i += PAGE_SIZE) {
-      let page = cur.slice(i, i + PAGE_SIZE);
+    for (let i = 0; i < prev.length; i += PAGE_SIZE) {
+      let page = prev.slice(i, i + PAGE_SIZE);
       if (page.length < PAGE_SIZE) {
         page = Buffer.concat([page, Buffer.alloc(PAGE_SIZE - page.length)]);
       }
       nxt.push(sha256(page));
     }
-    cur = Buffer.concat(nxt);
+    levels.push(Buffer.concat(nxt));
   }
+
+  const last = levels[levels.length - 1];
+  const root = sha256(Buffer.concat([last, Buffer.alloc(PAGE_SIZE - last.length)]));
+
+  // 树中间层 = 叶层与根所在层之间的所有层, 从下往上拼接
+  const mids = [];
+  if (levels.length > 2) {
+    for (let i = 1; i < levels.length - 1; i++) mids.push(levels[i]);
+  }
+  return { root, tree: Buffer.concat(mids) };
 }
 
 function buildDescriptor(sign_size, file_size, root, flags) {
@@ -374,8 +384,8 @@ function signElf(elf, force) {
   const { out: tmp0, cs_off } = injectCodesignSection(buf);
   const file_size = tmp0.length;
 
-  // 2. merkle 根哈希
-  const root = merkleRootHash(tmp0, cs_off, PAGE_SIZE);
+  // 2. merkle 根哈希 + 中间层哈希
+  const { root, tree } = merkleRootHashAndTree(tmp0, cs_off, PAGE_SIZE);
 
   // 3/4. descriptor(signSize=0) 用于摘要
   const desc_for_digest = buildDescriptor(0, file_size, root, FLAG_SELF_SIGN);
@@ -391,8 +401,14 @@ function signElf(elf, force) {
   desc_on_disk.copy(payload, 8);
   signature.copy(payload, 8 + DESC_SIZE);
 
-  // 8. 原地写入段内
+  // 8. 原地写入段内: payload 之后写 merkle 树中间层哈希
+  //    (与 binary-sign-tool 一致; 段 4KB 放不下时从叶侧截断)
   payload.copy(tmp0, cs_off);
+  const tree_start = cs_off + payload.length;
+  const tree_max = PAGE_SIZE - payload.length;
+  if (tree.length > 0) {
+    tree.copy(tmp0, tree_start, 0, Math.min(tree.length, tree_max));
+  }
   return tmp0;
 }
 

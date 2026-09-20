@@ -472,26 +472,42 @@ int inject_codesign_section(const uint8_t *elf, size_t elf_len,
 }
 
 /*
- * merkle_root_hash — fs-verity Merkle 树根哈希 (签名必需).
+ * merkle_root_hash_and_tree — fs-verity Merkle 树根哈希 + 中间层哈希
+ * (签名必需).
  *
  * 与上游 merkle_tree_builder.cpp::RunHashTask 等价:
  *   - 叶层: 每 4096B 一页 SHA-256, 末页零填充; 段所在页
  *     [cs_off/PAGE, ceil((cs_off+cs_len)/PAGE)) 的叶哈希全置 0
  *   - 上推: 每页打包 128 个 32B 哈希再 SHA-256, 末页零填充, 直到
  *     整层 packed <= 4096, 补零后哈希即根
+ *
+ * tree_out / tree_len 返回树中间层字节 (malloc 分配, 调用方 free):
+ * 从紧贴叶层的一层开始逐层向上, 每层的 32B 哈希顺序拼接; 单页文件
+ * 没有中间层 (*tree_out = NULL)。
  */
-void merkle_root_hash(const uint8_t *data, size_t len,
-                             uint64_t cs_off, uint64_t cs_len,
-                             uint8_t root[32]) {
+void merkle_root_hash_and_tree(const uint8_t *data, size_t len,
+                                      uint64_t cs_off, uint64_t cs_len,
+                                      uint8_t root[32],
+                                      uint8_t **tree_out, size_t *tree_len) {
     const size_t PAGE = 4096, H = 32;
     uint8_t page[PAGE];
+    *tree_out = NULL;
+    *tree_len = 0;
     if (len == 0) {
         memset(page, 0, PAGE); sha256(page, PAGE, root); return;
     }
     size_t npages = (len + PAGE - 1) / PAGE;
-    uint8_t *cur = malloc(npages * H);
     size_t cs_page_begin = (size_t)(cs_off / PAGE);
     size_t cs_page_end   = (size_t)((cs_off + cs_len + PAGE - 1) / PAGE);
+
+    /* levels[0] = 叶层, 最后一层是根所在层 */
+    size_t lev_cap = 8, nlev = 0;
+    uint8_t **levels = malloc(lev_cap * sizeof(uint8_t *));
+    size_t *level_len = malloc(lev_cap * sizeof(size_t));
+    if (!levels || !level_len) { free(levels); free(level_len); return; }
+
+    uint8_t *cur = malloc(npages * H);
+    if (!cur) { free(levels); free(level_len); return; }
     for (size_t i = 0; i < npages; i++) {
         if (cs_len > 0 && i >= cs_page_begin && i < cs_page_end) {
             memset(cur + i * H, 0, H);
@@ -503,29 +519,59 @@ void merkle_root_hash(const uint8_t *data, size_t len,
         memcpy(page, data + off, n);
         sha256(page, PAGE, cur + i * H);
     }
-    if (npages == 1) { memcpy(root, cur, H); free(cur); return; }
-    size_t ncur = npages; int owns = 1;
-    for (;;) {
-        size_t packed = ncur * H;
-        if (packed <= PAGE) {
-            memset(page, 0, PAGE);
-            memcpy(page, cur, packed);
-            sha256(page, PAGE, root);
-            if (owns) free(cur);
-            return;
+    levels[nlev] = cur; level_len[nlev] = npages * H; nlev++;
+
+    if (npages > 1) {
+        for (;;) {
+            uint8_t *prev = levels[nlev - 1];
+            size_t packed = level_len[nlev - 1];
+            if (packed <= PAGE) break;
+            size_t next_pages = (packed + PAGE - 1) / PAGE;
+            uint8_t *next = malloc(next_pages * H);
+            if (!next) break;
+            for (size_t i = 0; i < next_pages; i++) {
+                memset(page, 0, PAGE);
+                size_t off = i * PAGE;
+                size_t n = (off + PAGE <= packed) ? PAGE : (packed - off);
+                memcpy(page, prev + off, n);
+                sha256(page, PAGE, next + i * H);
+            }
+            if (nlev == lev_cap) {
+                lev_cap *= 2;
+                levels = realloc(levels, lev_cap * sizeof(uint8_t *));
+                level_len = realloc(level_len, lev_cap * sizeof(size_t));
+                if (!levels || !level_len) break;
+            }
+            levels[nlev] = next; level_len[nlev] = next_pages * H; nlev++;
         }
-        size_t next_pages = (packed + PAGE - 1) / PAGE;
-        uint8_t *next = malloc(next_pages * H);
-        for (size_t i = 0; i < next_pages; i++) {
-            memset(page, 0, PAGE);
-            size_t off = i * PAGE;
-            size_t n = (off + PAGE <= packed) ? PAGE : (packed - off);
-            memcpy(page, cur + off, n);
-            sha256(page, PAGE, next + i * H);
-        }
-        if (owns) free(cur);
-        cur = next; ncur = next_pages; owns = 1;
     }
+
+    /* 根: 最后一层补零后哈希 */
+    {
+        memset(page, 0, PAGE);
+        memcpy(page, levels[nlev - 1], level_len[nlev - 1] < PAGE
+                                        ? level_len[nlev - 1] : PAGE);
+        sha256(page, PAGE, root);
+    }
+
+    /* 树中间层 = 叶层与根所在层之间的所有层, 从下往上拼接 */
+    if (nlev > 2) {
+        size_t total = 0;
+        for (size_t i = 1; i + 1 < nlev; i++) total += level_len[i];
+        uint8_t *tree = malloc(total ? total : 1);
+        if (tree) {
+            size_t off = 0;
+            for (size_t i = 1; i + 1 < nlev; i++) {
+                memcpy(tree + off, levels[i], level_len[i]);
+                off += level_len[i];
+            }
+            *tree_out = tree;
+            *tree_len = total;
+        }
+    }
+    for (size_t i = 0; i < nlev; i++) free(levels[i]);
+    free(levels);
+    free(level_len);
 }
 
 /*
@@ -603,7 +649,9 @@ int sign_elf(const uint8_t *elf, size_t elf_len, int force,
 
     /* 2. merkle 根哈希: 跳过 [cs_off, cs_off+4096) */
     uint8_t root[32];
-    merkle_root_hash(tmp, tmp_len, cs_off, PAGE_SIZE, root);
+    uint8_t *tree = NULL; size_t tree_len = 0;
+    merkle_root_hash_and_tree(tmp, tmp_len, cs_off, PAGE_SIZE, root,
+                              &tree, &tree_len);
 
     /* 3/4. descriptor(signSize=0) 用于摘要, fileSize = 产物长度 */
     uint8_t desc_for_digest[256];
@@ -624,9 +672,17 @@ int sign_elf(const uint8_t *elf, size_t elf_len, int force,
     memcpy(payload + 8, desc_on_disk, DESC_SIZE);
     memcpy(payload + 8 + DESC_SIZE, signature, 32);
 
-    /* 8. 原地写入段内 */
-    if (cs_off + sizeof(payload) > tmp_len) { free(tmp); return -1; }
+    /* 8. 原地写入段内: payload 之后写 merkle 树中间层哈希
+     *    (与 binary-sign-tool 一致; 段 4KB 放不下时从叶侧截断) */
+    if (cs_off + sizeof(payload) > tmp_len) { free(tmp); free(tree); return -1; }
     memcpy(tmp + cs_off, payload, sizeof(payload));
+    size_t tree_start = (size_t)cs_off + sizeof(payload);
+    size_t tree_max = PAGE_SIZE - sizeof(payload);
+    if (tree && tree_len > 0) {
+        size_t n = tree_len < tree_max ? tree_len : tree_max;
+        memcpy(tmp + tree_start, tree, n);
+    }
+    free(tree);
 
     *out = tmp;
     *out_len = tmp_len;
