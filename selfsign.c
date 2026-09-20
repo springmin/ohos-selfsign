@@ -563,6 +563,44 @@ void build_descriptor(uint8_t *out /*256*/,
 }
 
 /*
+ * is_validly_signed — 校验已有自签名是否有效 (只读预检).
+ *
+ *   - ElfSignInfo 头 (type=1, length=288) 与 descriptor 的固定字段完好
+ *   - signSize=32 且 fileSize 等于实际文件大小
+ *   - 存储的 merkle 根与重算值一致
+ *   - 存储的签名等于 SHA256(signSize=0 的 descriptor)
+ *
+ * 返回 1 = 有效; 0 = 无效/未签名.
+ */
+int is_validly_signed(const uint8_t *elf, size_t elf_len) {
+    uint64_t e_shoff; uint16_t e_shnum, e_shstrndx;
+    if (parse_elf_header(elf, elf_len, &e_shoff, &e_shnum, &e_shstrndx) < 0) return 0;
+    int64_t cs_entry = find_section_by_name(elf, elf_len, e_shoff, e_shnum,
+                                            e_shstrndx, CODESIGN_NAME);
+    if (cs_entry < 0) return 0;
+    size_t cs_off = (size_t)read_u64(elf, elf_len, (size_t)cs_entry + 24);
+    size_t cs_len = (size_t)read_u64(elf, elf_len, (size_t)cs_entry + 32);
+    size_t sign_info_len = 8 + DESC_SIZE + 32;
+    if (cs_len < sign_info_len || cs_off > elf_len
+        || sign_info_len > elf_len - cs_off) return 0;
+    size_t d = cs_off + 8;
+    if (read_u32(elf, elf_len, cs_off) != FS_VERITY_DESCRIPTOR_TYPE
+        || read_u32(elf, elf_len, cs_off + 4) != (uint32_t)(DESC_SIZE + 32)) return 0;
+    if (elf[d] != 1 || elf[d+1] != 1 || elf[d+2] != 12 || elf[d+255] != 3) return 0;
+    uint32_t sign_size = read_u32(elf, elf_len, d + 4);
+    uint64_t data_size = read_u64(elf, elf_len, d + 8);
+    if (sign_size != 32 || data_size != (uint64_t)elf_len) return 0;
+    uint8_t root[32];
+    merkle_root_hash(elf, elf_len, cs_off, cs_len, root);
+    if (memcmp(elf + d + 16, root, 32) != 0) return 0;
+    uint8_t desc[DESC_SIZE];
+    build_descriptor(desc, 0, data_size, root, FLAG_SELF_SIGN);
+    uint8_t sig[32];
+    sha256(desc, DESC_SIZE, sig);
+    return memcmp(elf + d + DESC_SIZE, sig, 32) == 0;
+}
+
+/*
  * sign_elf — 签名主流程 (签名必需): 注入占位段 → merkle → descriptor →
  * signature → 拼 payload 写入段内.
  *
@@ -695,21 +733,44 @@ int sign_file_atomic(const char *path, int force) {
  */
 #ifndef SELFSIGN_AS_LIBRARY
 int main(int argc, char **argv) {
-    int force = 0, strip_only = 0;
+    int force = 0, strip_only = 0, check_only = 0;
     const char *in_path = NULL, *out_path = NULL;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--force") == 0 || strcmp(argv[i], "-f") == 0) force = 1;
         else if (strcmp(argv[i], "--strip") == 0) strip_only = 1;
+        else if (strcmp(argv[i], "--check") == 0) check_only = 1;
         else if (!in_path) in_path = argv[i];
         else if (!out_path) out_path = argv[i];
-        else { fprintf(stderr, "usage: %s <input_elf> [output_elf] [--force] [--strip]\n", argv[0]); return 1; }
+        else { fprintf(stderr, "usage: %s <input_elf> [output_elf] [--force] [--strip] [--check]\n", argv[0]); return 1; }
     }
     if (!in_path) {
-        fprintf(stderr, "usage: %s <input_elf> [output_elf] [--force] [--strip]\n"
+        fprintf(stderr, "usage: %s <input_elf> [output_elf] [--force] [--strip] [--check]\n"
                 "  (output defaults to input, in-place)\n", argv[0]);
         return 1;
     }
     if (!out_path) out_path = in_path;
+
+    if (check_only) {
+        /* --check: 只读校验已有自签名, 不解签名 */
+        FILE *cf = fopen(in_path, "rb");
+        if (!cf) { perror(in_path); return 2; }
+        fseek(cf, 0, SEEK_END); long csz = ftell(cf); fseek(cf, 0, SEEK_SET);
+        if (csz < 0) { fclose(cf); return 2; }
+        uint8_t *cbuf = malloc(csz > 0 ? (size_t)csz : 1);
+        if (!cbuf) { fclose(cf); return 2; }
+        if (csz > 0 && fread(cbuf, 1, (size_t)csz, cf) != (size_t)csz) {
+            free(cbuf); fclose(cf); return 2;
+        }
+        fclose(cf);
+        int ok = is_validly_signed(cbuf, (size_t)csz);
+        if (ok) {
+            printf("check ok: %s (valid self-sign, %ld bytes)\n", in_path, csz);
+        } else {
+            printf("check failed: %s (not a valid self-sign ELF)\n", in_path);
+        }
+        free(cbuf);
+        return ok ? 0 : 1;
+    }
 
     if (strip_only) {
         /* --strip: 仅预清洗/标准化, 不做签名 */

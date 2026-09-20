@@ -124,6 +124,46 @@ func hasCodesignSection(elf []byte) bool {
 	return findSectionByName(elf, h.eShOff, h.eShNum, h.eShStrndx, codesignName) >= 0
 }
 
+// isValidlySigned 校验已有自签名是否有效:
+// - ElfSignInfo 头 (type=1, length=288) 与 descriptor 的固定字段完好
+// - signSize=32 且 fileSize 等于实际文件大小
+// - 存储的 merkle 根与重算值一致
+// - 存储的签名等于 SHA256(signSize=0 的 descriptor)
+func isValidlySigned(elf []byte) bool {
+	h, err := parseElfHeader(elf)
+	if err != nil {
+		return false
+	}
+	csEntry := findSectionByName(elf, h.eShOff, h.eShNum, h.eShStrndx, codesignName)
+	if csEntry < 0 {
+		return false
+	}
+	csOff := int(readU64(elf, int(csEntry)+24))
+	csLen := int(readU64(elf, int(csEntry)+32))
+	signInfoLen := 8 + descSize + hashOut
+	if csLen < signInfoLen || csOff+signInfoLen > len(elf) {
+		return false
+	}
+	d := csOff + 8
+	if readU32(elf, csOff) != fsVerityDescriptorType ||
+		readU32(elf, csOff+4) != uint32(descSize+hashOut) {
+		return false
+	}
+	if elf[d] != 1 || elf[d+1] != 1 || elf[d+2] != 12 || elf[d+255] != 3 {
+		return false
+	}
+	if readU32(elf, d+4) != 32 || readU64(elf, d+8) != uint64(len(elf)) {
+		return false
+	}
+	root := merkleRootHash(elf, csOff, csLen)
+	if string(elf[d+16:d+48]) != string(root[:]) {
+		return false
+	}
+	desc := buildDescriptor(0, uint64(len(elf)), root, flagSelfSign)
+	sig := doSha256(desc[:])
+	return string(elf[d+descSize:d+descSize+hashOut]) == string(sig[:])
+}
+
 func newShstrndx(oldShstrndx uint16, csIdx int) uint16 {
 	if uint16(csIdx) < oldShstrndx {
 		return oldShstrndx - 1
@@ -448,24 +488,41 @@ func main() {
 	args := os.Args[1:]
 	force := false
 	stripOnly := false
+	checkOnly := false
 	var positional []string
 	for _, a := range args {
 		if a == "--force" || a == "-f" {
 			force = true
 		} else if a == "--strip" {
 			stripOnly = true
+		} else if a == "--check" {
+			checkOnly = true
 		} else {
 			positional = append(positional, a)
 		}
 	}
 	if len(positional) < 1 || len(positional) > 2 {
-		fmt.Fprintf(os.Stderr, "usage: %s <input_elf> [output_elf] [--force] [--strip]\n  (output defaults to input, in-place)\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "usage: %s <input_elf> [output_elf] [--force] [--strip] [--check]\n  (output defaults to input, in-place)\n", os.Args[0])
 		os.Exit(1)
 	}
 	inPath := positional[0]
 	outPath := inPath
 	if len(positional) == 2 {
 		outPath = positional[1]
+	}
+
+	if checkOnly {
+		raw, err := os.ReadFile(inPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(2)
+		}
+		if isValidlySigned(raw) {
+			fmt.Printf("check ok: %s (valid self-sign, %d bytes)\n", inPath, len(raw))
+			return
+		}
+		fmt.Printf("check failed: %s (not a valid self-sign ELF)\n", inPath)
+		os.Exit(1)
 	}
 
 	if stripOnly {

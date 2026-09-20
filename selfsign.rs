@@ -265,6 +265,51 @@ fn has_codesign_section(elf: &[u8]) -> bool {
     }
 }
 
+/// 校验已有自签名是否有效:
+/// - ElfSignInfo 头 (type=1, length=288) 与 descriptor 的固定字段完好
+/// - signSize=32 且 fileSize 等于实际文件大小
+/// - 存储的 merkle 根与重算值一致
+/// - 存储的签名等于 SHA256(signSize=0 的 descriptor)
+fn is_validly_signed(elf: &[u8]) -> bool {
+    let Ok((e_shoff, e_shnum, e_shstrndx)) = parse_elf_header(elf) else {
+        return false;
+    };
+    let cs_entry = find_section_by_name(elf, e_shoff, e_shnum, e_shstrndx, CODESIGN_NAME);
+    if cs_entry < 0 {
+        return false;
+    }
+    let cs_entry = cs_entry as usize;
+    let cs_off = read_u64(elf, cs_entry + 24) as usize;
+    let cs_len = read_u64(elf, cs_entry + 32) as usize;
+    const SIGN_INFO_LEN: usize = 8 + DESC_SIZE + HASH_OUT;
+    if cs_len < SIGN_INFO_LEN || cs_off > elf.len() || SIGN_INFO_LEN > elf.len() - cs_off {
+        return false;
+    }
+    let d = cs_off + 8;
+    if read_u32(elf, cs_off) != FS_VERITY_DESCRIPTOR_TYPE
+        || read_u32(elf, cs_off + 4) as usize != DESC_SIZE + HASH_OUT
+    {
+        return false;
+    }
+    if elf[d] != 1 || elf[d + 1] != 1 || elf[d + 2] != 12 || elf[d + 255] != 3 {
+        return false;
+    }
+    let sign_size = read_u32(elf, d + 4);
+    let data_size = read_u64(elf, d + 8);
+    if sign_size != 32 || data_size != elf.len() as u64 {
+        return false;
+    }
+    let mut stored_root = [0u8; 32];
+    stored_root.copy_from_slice(&elf[d + 16..d + 48]);
+    let root = merkle_root_hash(elf, cs_off, cs_len);
+    if stored_root != root {
+        return false;
+    }
+    let mut stored_signature = [0u8; 32];
+    stored_signature.copy_from_slice(&elf[d + DESC_SIZE..d + DESC_SIZE + HASH_OUT]);
+    stored_signature == sha256(&build_descriptor(0, data_size, &root, FLAG_SELF_SIGN))
+}
+
 fn new_shstrndx(old_shstrndx: u16, cs_idx: usize) -> u16 {
     if (cs_idx as u16) < old_shstrndx {
         old_shstrndx - 1
@@ -579,19 +624,22 @@ fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     let mut force = false;
     let mut strip_only = false;
+    let mut check_only = false;
     let mut positional: Vec<&str> = Vec::new();
     for a in &args {
         if a == "--force" || a == "-f" {
             force = true;
         } else if a == "--strip" {
             strip_only = true;
+        } else if a == "--check" {
+            check_only = true;
         } else {
             positional.push(a);
         }
     }
     if positional.is_empty() || positional.len() > 2 {
         eprintln!(
-            "usage: {} <input_elf> [output_elf] [--force] [--strip]\n  (output defaults to input, in-place)",
+            "usage: {} <input_elf> [output_elf] [--force] [--strip] [--check]\n  (output defaults to input, in-place)",
             env::args().next().unwrap_or_else(|| "selfsign".to_string())
         );
         process::exit(1);
@@ -604,6 +652,16 @@ fn main() {
     };
 
     let result: Result<i32, String> = (|| {
+        if check_only {
+            let raw = fs::read(in_path).map_err(|e| e.to_string())?;
+            if is_validly_signed(&raw) {
+                println!("check ok: {} (valid self-sign, {} bytes)", in_path, raw.len());
+                return Ok(0);
+            }
+            println!("check failed: {} (not a valid self-sign ELF)", in_path);
+            return Ok(1);
+        }
+
         if strip_only {
             let raw = fs::read(in_path).map_err(|e| e.to_string())?;
             let (removed, out) = strip_codesign(&raw)?;

@@ -140,6 +140,51 @@ function hasCodesignSection(elf) {
   }
 }
 
+function isValidlySigned(elf) {
+  // 校验已有自签名是否有效:
+  // - ElfSignInfo 头 (type=1, length=288) 与 descriptor 的固定字段完好
+  // - signSize=32 且 fileSize 等于实际文件大小
+  // - 存储的 merkle 根与重算值一致
+  // - 存储的签名等于 SHA256(signSize=0 的 descriptor)
+  let h;
+  try {
+    h = parseElfHeader(elf);
+  } catch (e) {
+    return false;
+  }
+  const cs_entry = findSectionByName(
+    elf,
+    h.e_shoff,
+    h.e_shnum,
+    h.e_shstrndx,
+    CODESIGN_NAME,
+  );
+  if (cs_entry < 0) return false;
+  const cs_off = readU64(elf, cs_entry + 24);
+  const cs_len = readU64(elf, cs_entry + 32);
+  const sign_info_len = 8 + DESC_SIZE + HASH_OUT;
+  if (cs_len < sign_info_len || cs_off + sign_info_len > elf.length) return false;
+  const d = cs_off + 8;
+  if (
+    readU32(elf, cs_off) !== FS_VERITY_DESCRIPTOR_TYPE ||
+    readU32(elf, cs_off + 4) !== DESC_SIZE + HASH_OUT
+  ) {
+    return false;
+  }
+  if (elf[d] !== 1 || elf[d + 1] !== 1 || elf[d + 2] !== 12 || elf[d + 255] !== 3) {
+    return false;
+  }
+  const sign_size = readU32(elf, d + 4);
+  const data_size = readU64(elf, d + 8);
+  if (sign_size !== 32 || data_size !== elf.length) return false;
+  const root = merkleRootHash(elf, cs_off, cs_len);
+  if (!elf.slice(d + 16, d + 48).equals(root)) return false;
+  const stored_signature = elf.slice(d + DESC_SIZE, d + DESC_SIZE + HASH_OUT);
+  return stored_signature.equals(
+    sha256(buildDescriptor(0, data_size, root, FLAG_SELF_SIGN)),
+  );
+}
+
 function newShstrndx(old_shstrndx, cs_idx) {
   return cs_idx < old_shstrndx ? old_shstrndx - 1 : old_shstrndx;
 }
@@ -422,15 +467,17 @@ function signFileAtomic(path, force) {
 function main() {
   let force = false;
   let strip_only = false;
+  let check_only = false;
   const positional = [];
   for (const a of process.argv.slice(2)) {
     if (a === "--force" || a === "-f") force = true;
     else if (a === "--strip") strip_only = true;
+    else if (a === "--check") check_only = true;
     else positional.push(a);
   }
   if (positional.length < 1 || positional.length > 2) {
     process.stderr.write(
-      `usage: ${process.argv[1]} <input_elf> [output_elf] [--force] [--strip]\n` +
+      `usage: ${process.argv[1]} <input_elf> [output_elf] [--force] [--strip] [--check]\n` +
         "  (output defaults to input, in-place)\n",
     );
     return 1;
@@ -439,6 +486,16 @@ function main() {
   const out_path = positional.length === 2 ? positional[1] : in_path;
 
   try {
+    if (check_only) {
+      const raw = fs.readFileSync(in_path);
+      if (isValidlySigned(raw)) {
+        console.log(`check ok: ${in_path} (valid self-sign, ${raw.length} bytes)`);
+        return 0;
+      }
+      console.log(`check failed: ${in_path} (not a valid self-sign ELF)`);
+      return 1;
+    }
+
     if (strip_only) {
       const raw = fs.readFileSync(in_path);
       const { removed, out } = stripCodesign(Buffer.from(raw));

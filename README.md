@@ -9,21 +9,21 @@
 ```sh
 # C 语言版（需编译，支持 gcc 和 clang）
 gcc selfsign.c -o selfsign
-./selfsign <input_elf> [output_elf] [--force] [--strip]
+./selfsign <input_elf> [output_elf] [--force] [--strip] [--check]
 
 # Python 版
-python3 selfsign.py <input_elf> [output_elf] [--force] [--strip]
+python3 selfsign.py <input_elf> [output_elf] [--force] [--strip] [--check]
 
 # JavaScript 版（Node.js）
-node selfsign.js <input_elf> [output_elf] [--force] [--strip]
+node selfsign.js <input_elf> [output_elf] [--force] [--strip] [--check]
 
 # Rust 版（需编译）
 rustc -O selfsign.rs -o selfsign
-./selfsign <input_elf> [output_elf] [--force] [--strip]
+./selfsign <input_elf> [output_elf] [--force] [--strip] [--check]
 
 # Go 版（需编译）
 go build -o selfsign selfsign.go
-./selfsign <input_elf> [output_elf] [--force] [--strip]
+./selfsign <input_elf> [output_elf] [--force] [--strip] [--check]
 ```
 
 参数说明：
@@ -34,6 +34,7 @@ go build -o selfsign selfsign.go
 | `[output_elf]` | 输出文件。缺省时原地处理（in-place），签名结果直接写回原文件。|
 | `--force` / `-f` | 强制重签。若 ELF 文件已有 .codesign 段（代码签名段），先剥离再重签。 |
 | `--strip` | 剥离签名。剥离 ELF 文件中的 .codesign 段（代码签名段）。 |
+| `--check` | 校验已有自签名是否有效（只读，不修改文件）。有效返回 0，无效返回 1。 |
 
 示例：
 
@@ -42,6 +43,7 @@ go build -o selfsign selfsign.go
 ./selfsign mybin mybin.signed       # 签名到新文件
 ./selfsign --force mybin            # 强制重签
 ./selfsign --strip mybin            # 剥离签名
+./selfsign --check mybin            # 校验签名
 ```
 
 ## 文件

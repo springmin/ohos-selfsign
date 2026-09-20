@@ -142,6 +142,43 @@ def has_codesign_section(elf: bytes) -> bool:
     return find_section_by_name(elf, e_shoff, e_shnum, e_shstrndx,
                                 CODESIGN_NAME) >= 0
 
+def is_validly_signed(elf: bytes) -> bool:
+    """校验已有自签名是否有效.
+
+    - ElfSignInfo 头 (type=1, length=288) 与 descriptor 的固定字段完好
+    - signSize=32 且 fileSize 等于实际文件大小
+    - 存储的 merkle 根与重算值一致
+    - 存储的签名等于 SHA256(signSize=0 的 descriptor)
+    """
+    try:
+        e_shoff, e_shnum, e_shstrndx = parse_elf_header(elf)
+    except ValueError:
+        return False
+    cs_entry = find_section_by_name(elf, e_shoff, e_shnum, e_shstrndx, CODESIGN_NAME)
+    if cs_entry < 0:
+        return False
+    cs_off = read_u64(elf, cs_entry + 24)
+    cs_len = read_u64(elf, cs_entry + 32)
+    sign_info_len = 8 + DESC_SIZE + HASH_OUT
+    if cs_len < sign_info_len or cs_off + sign_info_len > len(elf):
+        return False
+    d = cs_off + 8
+    if read_u32(elf, cs_off) != FS_VERITY_DESCRIPTOR_TYPE \
+            or read_u32(elf, cs_off + 4) != DESC_SIZE + HASH_OUT:
+        return False
+    if elf[d] != 1 or elf[d + 1] != 1 or elf[d + 2] != 12 or elf[d + 255] != 3:
+        return False
+    sign_size = read_u32(elf, d + 4)
+    data_size = read_u64(elf, d + 8)
+    if sign_size != 32 or data_size != len(elf):
+        return False
+    root = merkle_root_hash(elf, cs_off, cs_len)
+    if elf[d + 16: d + 48] != root:
+        return False
+    stored_signature = elf[d + DESC_SIZE: d + DESC_SIZE + HASH_OUT]
+    return stored_signature == sha256(
+        build_descriptor(0, data_size, root, FLAG_SELF_SIGN))
+
 
 def _new_shstrndx(old_shstrndx: int, cs_idx: int) -> int:
     """strip 时 shstrtab 在新 SHT 中的索引: 若 .codesign 在 shstrtab 之前被删,
@@ -479,23 +516,34 @@ def _read_file(path: str) -> bytes:
 def main() -> int:
     force = False
     strip_only = False
+    check_only = False
     positional = []
     for a in sys.argv[1:]:
         if a in ("--force", "-f"):
             force = True
         elif a == "--strip":
             strip_only = True
+        elif a == "--check":
+            check_only = True
         else:
             positional.append(a)
     if len(positional) < 1 or len(positional) > 2:
         sys.stderr.write(
-            f"usage: {sys.argv[0]} <input_elf> [output_elf] [--force] [--strip]\n"
+            f"usage: {sys.argv[0]} <input_elf> [output_elf] [--force] [--strip] [--check]\n"
             "  (output defaults to input, in-place)\n")
         return 1
     in_path = positional[0]
     out_path = positional[1] if len(positional) == 2 else in_path
 
     try:
+        if check_only:
+            raw = _read_file(in_path)
+            if is_validly_signed(raw):
+                print(f"check ok: {in_path} (valid self-sign, {len(raw)} bytes)")
+                return 0
+            print(f"check failed: {in_path} (not a valid self-sign ELF)")
+            return 1
+
         if strip_only:
             # --strip: 仅预清洗/标准化, 不做签名
             raw = bytearray(_read_file(in_path))
