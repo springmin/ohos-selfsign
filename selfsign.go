@@ -72,9 +72,10 @@ func doSha256(b []byte) [32]byte {
 
 // ─────────────────── ELF 预清洗/标准化 (非签名必需) ───────────────────
 type elfHeader struct {
-	eShOff    uint64
-	eShNum    uint16
-	eShStrndx uint16
+	eShOff     uint64
+	eShNum     uint16
+	eShStrndx  uint16
+	eShEntsize uint16
 }
 
 func parseElfHeader(elf []byte) (*elfHeader, error) {
@@ -86,25 +87,25 @@ func parseElfHeader(elf []byte) (*elfHeader, error) {
 	eShEntsize := readU16(elf, eShEntsize)
 	eShNum := readU16(elf, eShNum)
 	eShStrndx := readU16(elf, eShStrndx)
-	if eShEntsize != 64 || eShOff == 0 || eShNum == 0 || eShStrndx >= eShNum {
+	if eShEntsize < 64 || eShOff == 0 || eShNum == 0 || eShStrndx >= eShNum {
 		return nil, errors.New("ELF has no usable section header table")
 	}
-	if eShOff > uint64(len(elf)) || uint64(eShNum) > (uint64(len(elf))-eShOff)/64 {
+	if eShOff > uint64(len(elf)) || uint64(eShNum) > (uint64(len(elf))-eShOff)/uint64(eShEntsize) {
 		return nil, errors.New("section header table out of bounds")
 	}
-	return &elfHeader{eShOff: eShOff, eShNum: eShNum, eShStrndx: eShStrndx}, nil
+	return &elfHeader{eShOff: eShOff, eShNum: eShNum, eShStrndx: eShStrndx, eShEntsize: eShEntsize}, nil
 }
 
-func findSectionByName(elf []byte, eShOff uint64, eShNum, eShStrndx uint16, name []byte) int64 {
+func findSectionByName(elf []byte, eShOff uint64, eShNum, eShStrndx, eShEntsize uint16, name []byte) int64 {
 	nameLen := len(name)
-	shstrE := eShOff + uint64(eShStrndx)*64
+	shstrE := eShOff + uint64(eShStrndx)*uint64(eShEntsize)
 	shstrOff := readU64(elf, int(shstrE)+24)
 	shstrSz := readU64(elf, int(shstrE)+32)
 	if shstrOff > uint64(len(elf)) || shstrSz > uint64(len(elf))-shstrOff {
 		return -1
 	}
 	for i := uint16(0); i < eShNum; i++ {
-		e := eShOff + uint64(i)*64
+		e := eShOff + uint64(i)*uint64(eShEntsize)
 		nameOff := readU32(elf, int(e))
 		if uint64(nameOff)+uint64(nameLen) <= shstrSz {
 			start := int(shstrOff + uint64(nameOff))
@@ -121,7 +122,7 @@ func hasCodesignSection(elf []byte) bool {
 	if err != nil {
 		return false
 	}
-	return findSectionByName(elf, h.eShOff, h.eShNum, h.eShStrndx, codesignName) >= 0
+	return findSectionByName(elf, h.eShOff, h.eShNum, h.eShStrndx, h.eShEntsize, codesignName) >= 0
 }
 
 func newShstrndx(oldShstrndx uint16, csIdx int) uint16 {
@@ -139,13 +140,13 @@ func stripCodesign(buf []byte) (bool, []byte, error) {
 		return false, nil, err
 	}
 
-	csEntryOff := findSectionByName(elf, h.eShOff, h.eShNum, h.eShStrndx, codesignName)
+	csEntryOff := findSectionByName(elf, h.eShOff, h.eShNum, h.eShStrndx, h.eShEntsize, codesignName)
 	if csEntryOff < 0 {
 		return false, elf, nil
 	}
-	csIdx := int((uint64(csEntryOff) - h.eShOff) / 64)
+	csIdx := int((uint64(csEntryOff) - h.eShOff) / uint64(h.eShEntsize))
 
-	shstrE := h.eShOff + uint64(h.eShStrndx)*64
+	shstrE := h.eShOff + uint64(h.eShStrndx)*uint64(h.eShEntsize)
 	shstrOff := readU64(elf, int(shstrE)+24)
 	shstrSz := readU64(elf, int(shstrE)+32)
 	if shstrOff > uint64(len(elf)) || shstrSz > uint64(len(elf))-shstrOff {
@@ -166,13 +167,13 @@ func stripCodesign(buf []byte) (bool, []byte, error) {
 
 	// 3. 新 SHT = 旧 SHT 去掉 csIdx 条目
 	newShNum := h.eShNum - 1
-	newSht := make([]byte, 0, int(newShNum)*64)
+	newSht := make([]byte, 0, int(newShNum)*int(h.eShEntsize))
 	for i := uint16(0); i < h.eShNum; i++ {
 		if int(i) == csIdx {
 			continue
 		}
-		e := int(h.eShOff) + int(i)*64
-		newSht = append(newSht, elf[e:e+64]...)
+		e := int(h.eShOff) + int(i)*int(h.eShEntsize)
+		newSht = append(newSht, elf[e:e+int(h.eShEntsize)]...)
 	}
 
 	// 4. 截断到 .codesign 段文件偏移, 依次追加 新shstrtab / 8B对齐 新SHT
@@ -183,7 +184,7 @@ func stripCodesign(buf []byte) (bool, []byte, error) {
 	}
 	newShstrOff := keepLen
 	newShtOff := int(alignUp(uint64(newShstrOff+newShstrSz), 8))
-	newTotal := newShtOff + int(newShNum)*64
+	newTotal := newShtOff + int(newShNum)*int(h.eShEntsize)
 
 	out := make([]byte, newTotal)
 	copy(out, elf[:keepLen])
@@ -191,13 +192,13 @@ func stripCodesign(buf []byte) (bool, []byte, error) {
 	copy(out[newShtOff:], newSht)
 
 	// 5. 重写 shstrtab 条目
-	shstrEntryOffInNew := int(newShstrndx(h.eShStrndx, csIdx)) * 64
+	shstrEntryOffInNew := int(newShstrndx(h.eShStrndx, csIdx)) * int(h.eShEntsize)
 	writeU64(out, newShtOff+shstrEntryOffInNew+24, uint64(newShstrOff))
 	writeU64(out, newShtOff+shstrEntryOffInNew+32, uint64(newShstrSz))
 
 	// 6. 所有 sh_name > cs_name_off 的段名偏移整体前移 cs_name_len
 	for i := 0; i < int(newShNum); i++ {
-		e := newShtOff + i*64
+		e := newShtOff + i*int(h.eShEntsize)
 		noff := readU32(out, e)
 		if noff > csNameOff {
 			writeU32(out, e, noff-uint32(csNameLen))
@@ -221,7 +222,7 @@ func injectCodesignSection(elf []byte) ([]byte, int, error) {
 		return nil, 0, err
 	}
 
-	shstrE := h.eShOff + uint64(h.eShStrndx)*64
+	shstrE := h.eShOff + uint64(h.eShStrndx)*uint64(h.eShEntsize)
 	shstrOff := readU64(elf, int(shstrE)+24)
 	shstrSz := readU64(elf, int(shstrE)+32)
 	if shstrOff > uint64(len(elf)) || shstrSz > uint64(len(elf))-shstrOff {
@@ -229,9 +230,9 @@ func injectCodesignSection(elf []byte) ([]byte, int, error) {
 	}
 
 	// 1. cur_end: SHT 末尾与各段 off+sz 的最大值 (SHT_NOBITS=8 不占文件)
-	curEnd := h.eShOff + uint64(h.eShNum)*64
+	curEnd := h.eShOff + uint64(h.eShNum)*uint64(h.eShEntsize)
 	for i := uint16(0); i < h.eShNum; i++ {
-		e := h.eShOff + uint64(i)*64
+		e := h.eShOff + uint64(i)*uint64(h.eShEntsize)
 		shType := readU32(elf, int(e)+4)
 		off := readU64(elf, int(e)+24)
 		var sz uint64
@@ -241,6 +242,11 @@ func injectCodesignSection(elf []byte) ([]byte, int, error) {
 		if off+sz > curEnd {
 			curEnd = off + sz
 		}
+	}
+	// 段表未覆盖的尾部数据 (如 Bun standalone 的 module graph) 也必须计入:
+	// 否则 csOff 会落在这些数据中间, 拷贝按 csOff 截断时整段丢失.
+	if uint64(len(elf)) > curEnd {
+		curEnd = uint64(len(elf))
 	}
 	csOff := int(alignUp(curEnd, pageSize))
 
@@ -256,7 +262,7 @@ func injectCodesignSection(elf []byte) ([]byte, int, error) {
 	newShstrOff := csOff + pageSize
 	newShtOff := int(alignUp(uint64(newShstrOff+newShstrSz), 8))
 	newShNum := h.eShNum + 1
-	newTotal := newShtOff + int(newShNum)*64
+	newTotal := newShtOff + int(newShNum)*int(h.eShEntsize)
 
 	buf := make([]byte, newTotal)
 	// 4. 拷贝原内容: 只拷到 cs_off
@@ -271,10 +277,10 @@ func injectCodesignSection(elf []byte) ([]byte, int, error) {
 
 	copy(buf[newShstrOff:], newShstr)
 	shtStart := int(h.eShOff)
-	copy(buf[newShtOff:newShtOff+int(h.eShNum)*64], elf[shtStart:shtStart+int(h.eShNum)*64])
+	copy(buf[newShtOff:newShtOff+int(h.eShNum)*int(h.eShEntsize)], elf[shtStart:shtStart+int(h.eShNum)*int(h.eShEntsize)])
 
-	// .codesign 段条目 (64B)
-	csE := newShtOff + int(h.eShNum)*64
+	// .codesign 段条目
+	csE := newShtOff + int(h.eShNum)*int(h.eShEntsize)
 	writeU32(buf, csE, csShname)         // sh_name
 	writeU32(buf, csE+4, 1)              // sh_type = SHT_PROGBITS
 	writeU64(buf, csE+24, uint64(csOff)) // sh_offset
@@ -282,7 +288,7 @@ func injectCodesignSection(elf []byte) ([]byte, int, error) {
 	writeU64(buf, csE+48, pageSize)      // sh_addralign
 
 	// 更新 shstrtab 条目偏移/大小
-	shstrENew := newShtOff + int(h.eShStrndx)*64
+	shstrENew := newShtOff + int(h.eShStrndx)*int(h.eShEntsize)
 	writeU64(buf, shstrENew+24, uint64(newShstrOff))
 	writeU64(buf, shstrENew+32, uint64(newShstrSz))
 

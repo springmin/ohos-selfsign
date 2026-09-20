@@ -189,15 +189,15 @@ static const char CODESIGN_NAME[10] = ".codesign\0";
  *
  * 这不是签名算法的一部分, 而是签名/剥离共用的"先决条件检查":
  *  - 校验魔数 \x7fELF + ELFCLASS64
- *  - 校验 e_shentsize == 64 (必须为 64; 旧版 C 实现漏掉此项, 非 64 字节
- *    的 SHT 条目会直接导致后续计算错误)
+ *  - 校验 e_shentsize >= 64 (条目至少能容纳标准 64 字节; 允许更大,
+ *    解析按实际条目大小进行)
  *  - 校验 SHT 不越界 (checked_add 语义), e_shstrndx < e_shnum
- * 返回 0 表示通过, 输出 e_shoff/e_shnum/e_shstrndx; 返回 -1 表示不是
+ * 返回 0 表示通过, 输出 e_shoff/e_shnum/e_shstrndx/e_shentsize; 返回 -1 表示不是
  * 可处理的 ELF64.
  */
 int parse_elf_header(const uint8_t *elf, size_t elf_len,
                             uint64_t *e_shoff, uint16_t *e_shnum,
-                            uint16_t *e_shstrndx) {
+                            uint16_t *e_shstrndx, uint16_t *e_shentsize) {
     if (elf_len < 64 || memcmp(elf, "\x7f""ELF", 4) != 0 || elf[4] != 2) {
         fprintf(stderr, "error: not ELF64\n");
         return -1;
@@ -206,18 +206,19 @@ int parse_elf_header(const uint8_t *elf, size_t elf_len,
     uint16_t shentsize = read_u16(elf, elf_len, E_SHENTSIZE);
     uint16_t shnum = read_u16(elf, elf_len, E_SHNUM);
     uint16_t shstrndx = read_u16(elf, elf_len, E_SHSTRNDX);
-    if (shentsize != 64 || shoff == 0 || shnum == 0 || (uint64_t)shstrndx >= (uint64_t)shnum) {
+    if (shentsize < 64 || shoff == 0 || shnum == 0 || (uint64_t)shstrndx >= (uint64_t)shnum) {
         fprintf(stderr, "error: ELF has no usable section header table\n");
         return -1;
     }
-    /* SHT 越界检查: e_shoff + e_shnum*64 必须落在文件内 (对应 checked_add + 比较) */
-    if (shoff > elf_len || shnum > (elf_len - shoff) / 64) {
+    /* SHT 越界检查: e_shoff + e_shnum*e_shentsize 必须落在文件内 */
+    if (shoff > elf_len || shnum > (elf_len - shoff) / shentsize) {
         fprintf(stderr, "error: section header table out of bounds\n");
         return -1;
     }
     *e_shoff = shoff;
     *e_shnum = shnum;
     *e_shstrndx = shstrndx;
+    *e_shentsize = shentsize;
     return 0;
 }
 
@@ -226,19 +227,20 @@ int parse_elf_header(const uint8_t *elf, size_t elf_len,
  *
  * 先经 shstrtab entry 解析出字符串表位置并做越界检查, 再遍历所有段条目
  * 比较 sh_name 指向的名字.
- * 返回段条目在文件中的偏移 (即 e_shoff + idx*64), 未找到返回 -1.
+ * 返回段条目在文件中的偏移 (即 e_shoff + idx*e_shentsize), 未找到返回 -1.
  */
 int64_t find_section_by_name(const uint8_t *elf, size_t elf_len,
                                     uint64_t e_shoff, uint16_t e_shnum,
-                                    uint16_t e_shstrndx, const char *name) {
+                                    uint16_t e_shstrndx, uint16_t e_shentsize,
+                                    const char *name) {
     size_t name_len = strlen(name) + 1; /* 含 NUL */
-    size_t shstr_e = (size_t)e_shoff + (size_t)e_shstrndx * 64;
+    size_t shstr_e = (size_t)e_shoff + (size_t)e_shstrndx * e_shentsize;
     uint64_t shstr_off = read_u64(elf, elf_len, shstr_e + 24);
     uint64_t shstr_sz = read_u64(elf, elf_len, shstr_e + 32);
     /* 用减法形式避免 shstr_off + shstr_sz 回绕 */
     if (shstr_off > elf_len || shstr_sz > elf_len - shstr_off) return -1;
     for (uint16_t i = 0; i < e_shnum; i++) {
-        size_t e = (size_t)e_shoff + (size_t)i * 64;
+        size_t e = (size_t)e_shoff + (size_t)i * e_shentsize;
         uint32_t name_off = read_u32(elf, elf_len, e);
         if ((uint64_t)name_off + name_len <= shstr_sz) {
             if (memcmp(elf + shstr_off + name_off, name, name_len) == 0) {
@@ -257,9 +259,9 @@ int64_t find_section_by_name(const uint8_t *elf, size_t elf_len,
  *   - --force 模式: 已含则先走 strip_codesign 再签
  */
 int has_codesign_section(const uint8_t *elf, size_t elf_len) {
-    uint64_t e_shoff; uint16_t e_shnum, e_shstrndx;
-    if (parse_elf_header(elf, elf_len, &e_shoff, &e_shnum, &e_shstrndx) < 0) return 0;
-    return find_section_by_name(elf, elf_len, e_shoff, e_shnum, e_shstrndx,
+    uint64_t e_shoff; uint16_t e_shnum, e_shstrndx, e_shentsize;
+    if (parse_elf_header(elf, elf_len, &e_shoff, &e_shnum, &e_shstrndx, &e_shentsize) < 0) return 0;
+    return find_section_by_name(elf, elf_len, e_shoff, e_shnum, e_shstrndx, e_shentsize,
                                 CODESIGN_NAME) >= 0 ? 1 : 0;
 }
 
@@ -292,16 +294,16 @@ static uint16_t new_shstrndx(uint16_t old_shstrndx, size_t cs_idx) {
 int strip_codesign(uint8_t **buf, size_t *buf_len) {
     uint8_t *elf = *buf;
     size_t elf_len = *buf_len;
-    uint64_t e_shoff; uint16_t e_shnum, e_shstrndx;
-    if (parse_elf_header(elf, elf_len, &e_shoff, &e_shnum, &e_shstrndx) < 0) return -1;
+    uint64_t e_shoff; uint16_t e_shnum, e_shstrndx, e_shentsize;
+    if (parse_elf_header(elf, elf_len, &e_shoff, &e_shnum, &e_shstrndx, &e_shentsize) < 0) return -1;
 
     int64_t cs_entry_off = find_section_by_name(elf, elf_len, e_shoff, e_shnum,
-                                                e_shstrndx, CODESIGN_NAME);
+                                                e_shstrndx, e_shentsize, CODESIGN_NAME);
     if (cs_entry_off < 0) return 0; /* 无 .codesign, 无需清洗 */
-    size_t cs_idx = ((size_t)cs_entry_off - (size_t)e_shoff) / 64;
+    size_t cs_idx = ((size_t)cs_entry_off - (size_t)e_shoff) / e_shentsize;
 
     /* 读 shstrtab 位置并做越界检查 */
-    size_t shstr_e = (size_t)e_shoff + (size_t)e_shstrndx * 64;
+    size_t shstr_e = (size_t)e_shoff + (size_t)e_shstrndx * e_shentsize;
     size_t shstr_off = (size_t)read_u64(elf, elf_len, shstr_e + 24);
     size_t shstr_sz = (size_t)read_u64(elf, elf_len, shstr_e + 32);
     if (shstr_off > elf_len || shstr_sz > elf_len - shstr_off) {
@@ -324,14 +326,14 @@ int strip_codesign(uint8_t **buf, size_t *buf_len) {
 
     /* 3. 新 SHT = 旧 SHT 去掉 cs_idx 条目 */
     uint16_t new_shnum = e_shnum - 1;
-    size_t new_sht_bytes = (size_t)new_shnum * 64;
+    size_t new_sht_bytes = (size_t)new_shnum * e_shentsize;
     uint8_t *new_sht = malloc(new_sht_bytes);
     if (!new_sht) { free(new_shstr); fprintf(stderr, "error: out of memory\n"); return -1; }
     size_t dst = 0;
     for (uint16_t i = 0; i < e_shnum; i++) {
         if (i == cs_idx) continue;
-        memcpy(new_sht + dst, elf + (size_t)e_shoff + (size_t)i * 64, 64);
-        dst += 64;
+        memcpy(new_sht + dst, elf + (size_t)e_shoff + (size_t)i * e_shentsize, e_shentsize);
+        dst += e_shentsize;
     }
 
     /* 4. 截断到 .codesign 段文件偏移, 依次追加 新shstrtab / 8B对齐 新SHT */
@@ -350,13 +352,13 @@ int strip_codesign(uint8_t **buf, size_t *buf_len) {
     free(new_sht);
 
     /* 5. 重写 shstrtab 条目: 新 shstr 位置/大小 (cs_idx 在 shstrtab 前后时索引不同) */
-    size_t shstr_entry_off_in_new = (size_t)new_shstrndx(e_shstrndx, cs_idx) * 64;
+    size_t shstr_entry_off_in_new = (size_t)new_shstrndx(e_shstrndx, cs_idx) * e_shentsize;
     write_u64(out, new_sht_off + shstr_entry_off_in_new + 24, new_shstr_off);
     write_u64(out, new_sht_off + shstr_entry_off_in_new + 32, new_shstr_sz);
 
     /* 6. 所有 sh_name > cs_name_off 的段名偏移整体前移 cs_name_len */
     for (uint16_t i = 0; i < new_shnum; i++) {
-        size_t e = new_sht_off + (size_t)i * 64;
+        size_t e = new_sht_off + (size_t)i * e_shentsize;
         uint32_t noff = read_u32(out, new_total, e);
         if (noff > cs_name_off) write_u32(out, e, noff - (uint32_t)cs_name_len);
     }
@@ -378,27 +380,28 @@ int strip_codesign(uint8_t **buf, size_t *buf_len) {
  * inject_codesign_section — 注入 4KB 占位 .codesign 段 (签名第一步).
  *
  * 这是签名算法的必要组成部分, 流程如下:
- *   1. 计算所有段末尾的最大值 cur_end = max(e_shoff+e_shnum*64, 各段 off+sz
+ *   1. 计算所有段末尾的最大值 cur_end = max(e_shoff+e_shnum*e_shentsize, 各段 off+sz
  *      [SHT_NOBITS 不计]), 段文件偏移 cs_off = align_up(cur_end, 4096)
  *   2. 新 shstrtab = 旧 + ".codesign\0"; 落位 cs_off+4096
  *   3. 新 SHT 落位新 shstrtab 之后 (8B 对齐), 复制旧 SHT, 追加 .codesign 条目
  *      (sh_type=SHT_PROGBITS, sh_offset=cs_off, sh_size=4096, sh_addralign=4096)
  *   4. 更新 shstrtab 条目偏移/大小, 更新 header e_shoff/e_shnum (e_shstrndx 不变)
  *
- * 关键差异: 只拷贝 [0, min(elf_len, cs_off)) 的原始内容, cs_off 之后到
- * 新布局之间的区域全部保持 0 — 若输入文件在段末尾之外还拖着额外字节,
- * 那些字节不进产物.
+ * 尾部数据: cur_end 与文件真实长度取最大值, 保证追加在最后一个段之后、
+ * 不被任何段覆盖的数据 (如 Bun standalone 的 module graph) 一并保留.
+ * 产物只拷贝 [0, min(elf_len, cs_off)) 的原始内容, cs_off 之后到新布局
+ * 之间的区域全部保持 0.
  *
  * 返回 0 成功, *out_len 为产物长度, *cs_off_out 为段文件偏移; -1 失败.
  */
 int inject_codesign_section(const uint8_t *elf, size_t elf_len,
                                    uint8_t **out, size_t *out_len,
                                    uint64_t *cs_off_out) {
-    uint64_t e_shoff; uint16_t e_shnum, e_shstrndx;
-    if (parse_elf_header(elf, elf_len, &e_shoff, &e_shnum, &e_shstrndx) < 0) return -1;
+    uint64_t e_shoff; uint16_t e_shnum, e_shstrndx, e_shentsize;
+    if (parse_elf_header(elf, elf_len, &e_shoff, &e_shnum, &e_shstrndx, &e_shentsize) < 0) return -1;
 
     /* shstrtab entry (用于取旧 shstr 内容) */
-    size_t shstr_e = (size_t)e_shoff + (size_t)e_shstrndx * 64;
+    size_t shstr_e = (size_t)e_shoff + (size_t)e_shstrndx * e_shentsize;
     uint64_t shstr_off = read_u64(elf, elf_len, shstr_e + 24);
     uint64_t shstr_sz = read_u64(elf, elf_len, shstr_e + 32);
     if (shstr_off > elf_len || shstr_sz > elf_len - shstr_off) {
@@ -407,14 +410,17 @@ int inject_codesign_section(const uint8_t *elf, size_t elf_len,
     }
 
     /* 1. cur_end: SHT 末尾与各段 off+sz 的最大值 (SHT_NOBITS=8 不占文件) */
-    uint64_t cur_end = e_shoff + (uint64_t)e_shnum * 64;
+    uint64_t cur_end = e_shoff + (uint64_t)e_shnum * e_shentsize;
     for (uint16_t i = 0; i < e_shnum; i++) {
-        size_t e = (size_t)e_shoff + (size_t)i * 64;
+        size_t e = (size_t)e_shoff + (size_t)i * e_shentsize;
         uint32_t sh_type = read_u32(elf, elf_len, e + 4);
         uint64_t off = read_u64(elf, elf_len, e + 24);
         uint64_t sz = sh_type == 8 ? 0 : read_u64(elf, elf_len, e + 32);
         if (off + sz > cur_end) cur_end = off + sz;
     }
+    /* 段表未覆盖的尾部数据 (如 Bun standalone 的 module graph) 也必须计入:
+     * 否则 cs_off 会落在这些数据中间, 拷贝按 cs_off 截断时整段丢失. */
+    if ((uint64_t)elf_len > cur_end) cur_end = (uint64_t)elf_len;
     uint64_t cs_off = align_up(cur_end, PAGE_SIZE);
 
     /* 2. 新 shstrtab = 旧 + ".codesign\0" */
@@ -430,7 +436,7 @@ int inject_codesign_section(const uint8_t *elf, size_t elf_len,
     uint64_t new_shstr_off = cs_off + PAGE_SIZE;
     uint64_t new_sht_off = align_up(new_shstr_off + new_shstr_sz, 8);
     uint16_t new_shnum = e_shnum + 1;
-    size_t new_total = (size_t)new_sht_off + (size_t)new_shnum * 64;
+    size_t new_total = (size_t)new_sht_off + (size_t)new_shnum * e_shentsize;
 
     uint8_t *buf = calloc(1, new_total);
     if (!buf) { free(new_shstr); fprintf(stderr, "error: out of memory\n"); return -1; }
@@ -442,11 +448,11 @@ int inject_codesign_section(const uint8_t *elf, size_t elf_len,
     /* cs_off..cs_off+4096 为段占位 (calloc 全 0), 稍后写入 payload */
 
     memcpy(buf + new_shstr_off, new_shstr, new_shstr_sz);
-    memcpy(buf + new_sht_off, elf + (size_t)e_shoff, (size_t)e_shnum * 64);
+    memcpy(buf + new_sht_off, elf + (size_t)e_shoff, (size_t)e_shnum * e_shentsize);
     free(new_shstr);
 
-    /* .codesign 段条目 (64B) */
-    size_t cs_e = (size_t)new_sht_off + (size_t)e_shnum * 64;
+    /* .codesign 段条目 */
+    size_t cs_e = (size_t)new_sht_off + (size_t)e_shnum * e_shentsize;
     write_u32(buf, cs_e + 0, cs_shname);            /* sh_name */
     write_u32(buf, cs_e + 4, 1);                    /* sh_type = SHT_PROGBITS */
     /* sh_flags/sh_addr 保持 0 */
@@ -457,7 +463,7 @@ int inject_codesign_section(const uint8_t *elf, size_t elf_len,
     /* sh_entsize 保持 0 */
 
     /* 更新 shstrtab 条目偏移/大小 (在新 SHT 中的索引仍为 e_shstrndx) */
-    size_t shstr_e_new = (size_t)new_sht_off + (size_t)e_shstrndx * 64;
+    size_t shstr_e_new = (size_t)new_sht_off + (size_t)e_shstrndx * e_shentsize;
     write_u64(buf, shstr_e_new + 24, new_shstr_off);
     write_u64(buf, shstr_e_new + 32, new_shstr_sz);
 
