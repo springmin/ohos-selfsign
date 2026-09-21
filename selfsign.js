@@ -234,7 +234,8 @@ function injectCodesignSection(elf) {
     throw new Error("shstrtab out of bounds");
   }
 
-  // 1. cur_end: SHT 末尾与各段 off+sz 的最大值 (SHT_NOBITS=8 不占文件)
+  // 1. cur_end: SHT 末尾与各段 off+sz 的最大值 (SHT_NOBITS=8 不占文件),
+  // 且不小于文件实际长度 (段表之后可能拖着附加数据)
   let cur_end = e_shoff + e_shnum * 64;
   for (let i = 0; i < e_shnum; i++) {
     const e = e_shoff + i * 64;
@@ -243,6 +244,7 @@ function injectCodesignSection(elf) {
     const sz = sh_type === 8 ? 0 : readU64(elf, e + 32);
     if (off + sz > cur_end) cur_end = off + sz;
   }
+  if (elf.length > cur_end) cur_end = elf.length;
   const cs_off = alignUp(cur_end, PAGE_SIZE);
 
   // 2. 新 shstrtab = 旧 + ".codesign\0"

@@ -239,15 +239,15 @@ def inject_codesign_section(elf: bytes) -> tuple[bytes, int]:
 
     这是签名算法的必要组成部分, 流程如下:
       1. 计算所有段末尾的最大值 cur_end = max(e_shoff+e_shnum*64, 各段 off+sz
-         [SHT_NOBITS 不计]), 段文件偏移 cs_off = align_up(cur_end, 4096)
+         [SHT_NOBITS 不计], 文件实际长度), 段文件偏移 cs_off = align_up(cur_end, 4096)
       2. 新 shstrtab = 旧 + ".codesign\\0"; 落位 cs_off+4096
       3. 新 SHT 落位新 shstrtab 之后 (8B 对齐), 复制旧 SHT, 追加 .codesign 条目
          (sh_type=SHT_PROGBITS, sh_offset=cs_off, sh_size=4096, sh_addralign=4096)
       4. 更新 shstrtab 条目偏移/大小, 更新 header e_shoff/e_shnum (e_shstrndx 不变)
 
     关键差异: 只拷贝 [0, min(len(elf), cs_off)) 的原始内容, cs_off 之后到
-    新布局之间的区域全部保持 0 — 若输入文件在段末尾之外还拖着额外字节,
-    那些字节不进产物.
+    新布局之间的区域全部保持 0 — cur_end 已计入文件实际长度, 故段表之后
+    拖着的额外字节 (如 Bun/.NET SingleFile 附加数据) 同样进入产物.
 
     返回 (含段产物, 段文件偏移).
     """
@@ -260,7 +260,8 @@ def inject_codesign_section(elf: bytes) -> tuple[bytes, int]:
     if shstr_off + shstr_sz > len(elf):
         raise ValueError("shstrtab out of bounds")
 
-    # 1. cur_end: SHT 末尾与各段 off+sz 的最大值 (SHT_NOBITS=8 不占文件)
+    # 1. cur_end: SHT 末尾与各段 off+sz 的最大值 (SHT_NOBITS=8 不占文件),
+    # 且不小于文件实际长度 (段表之后可能拖着附加数据)
     cur_end = e_shoff + e_shnum * 64
     for i in range(e_shnum):
         e = e_shoff + i * 64
@@ -269,6 +270,8 @@ def inject_codesign_section(elf: bytes) -> tuple[bytes, int]:
         sz = 0 if sh_type == 8 else read_u64(elf, e + 32)
         if off + sz > cur_end:
             cur_end = off + sz
+    if len(elf) > cur_end:
+        cur_end = len(elf)
     cs_off = align_up(cur_end, PAGE_SIZE)
 
     # 2. 新 shstrtab = 旧 + ".codesign\0"

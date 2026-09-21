@@ -367,7 +367,8 @@ fn inject_codesign_section(elf: &[u8]) -> Result<(Vec<u8>, usize), String> {
         return Err("shstrtab out of bounds".to_string());
     }
 
-    // 1. cur_end: SHT 末尾与各段 off+sz 的最大值 (SHT_NOBITS=8 不占文件)
+    // 1. cur_end: SHT 末尾与各段 off+sz 的最大值 (SHT_NOBITS=8 不占文件),
+    // 且不小于文件实际长度 (段表之后可能拖着附加数据)
     let mut cur_end = e_shoff + (e_shnum as u64) * 64;
     for i in 0..e_shnum {
         let e = e_shoff + (i as u64) * 64;
@@ -381,6 +382,9 @@ fn inject_codesign_section(elf: &[u8]) -> Result<(Vec<u8>, usize), String> {
         if off + sz > cur_end {
             cur_end = off + sz;
         }
+    }
+    if elf.len() as u64 > cur_end {
+        cur_end = elf.len() as u64;
     }
     let cs_off = align_up(cur_end, PAGE_SIZE as u64) as usize;
 

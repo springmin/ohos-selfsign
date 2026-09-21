@@ -228,7 +228,8 @@ func injectCodesignSection(elf []byte) ([]byte, int, error) {
 		return nil, 0, errors.New("shstrtab out of bounds")
 	}
 
-	// 1. cur_end: SHT 末尾与各段 off+sz 的最大值 (SHT_NOBITS=8 不占文件)
+	// 1. cur_end: SHT 末尾与各段 off+sz 的最大值 (SHT_NOBITS=8 不占文件),
+	// 且不小于文件实际长度 (段表之后可能拖着附加数据)
 	curEnd := h.eShOff + uint64(h.eShNum)*64
 	for i := uint16(0); i < h.eShNum; i++ {
 		e := h.eShOff + uint64(i)*64
@@ -241,6 +242,9 @@ func injectCodesignSection(elf []byte) ([]byte, int, error) {
 		if off+sz > curEnd {
 			curEnd = off + sz
 		}
+	}
+	if uint64(len(elf)) > curEnd {
+		curEnd = uint64(len(elf))
 	}
 	csOff := int(alignUp(curEnd, pageSize))
 
