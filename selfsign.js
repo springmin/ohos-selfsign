@@ -505,7 +505,7 @@ module.exports = {
   hasCodesignSection,// (elf: Buffer) => boolean
   injectCodesignSection, // (elf: Buffer) => { out: Buffer, cs_off: number }
   // 算法核心（导出便于复用/测试）
-  merkleRootHash,
+  merkleRootHashAndTree,
   buildDescriptor,
   parseElfHeader,
   findSectionByName,
