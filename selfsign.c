@@ -480,19 +480,29 @@ int inject_codesign_section(const uint8_t *elf, size_t elf_len,
 }
 
 /*
- * merkle_root_hash — fs-verity Merkle 树根哈希 (签名必需).
+ * merkle_root_hash — fs-verity Merkle 树根哈希 + 中间层哈希 (签名必需).
  *
  * 与上游 merkle_tree_builder.cpp::RunHashTask 等价:
  *   - 叶层: 每 4096B 一页 SHA-256, 末页零填充; 段所在页
  *     [cs_off/PAGE, ceil((cs_off+cs_len)/PAGE)) 的叶哈希全置 0
  *   - 上推: 每页打包 128 个 32B 哈希再 SHA-256, 末页零填充, 直到
  *     整层 packed <= 4096, 补零后哈希即根
+ *
+ * 根哈希写入 root[32]; 中间层 (叶层与根所在层之间的所有层, 从低往高
+ * 逐层把 32B 哈希按顺序拼接, 叶层 <= 4096B 时不存在) 经 *mid_out /
+ * *mid_len_out 传出, 由调用方 free, 签名时写入 .codesign 段内
+ * payload 之后.
  */
 void merkle_root_hash(const uint8_t *data, size_t len,
                              uint64_t cs_off, uint64_t cs_len,
-                             uint8_t root[32]) {
+                             uint8_t root[32],
+                             uint8_t **mid_out, size_t *mid_len_out) {
     const size_t PAGE = 4096, H = 32;
     uint8_t page[PAGE];
+    uint8_t *mid = NULL;
+    size_t mid_len = 0;
+    *mid_out = NULL;
+    *mid_len_out = 0;
     if (len == 0) {
         memset(page, 0, PAGE); sha256(page, PAGE, root); return;
     }
@@ -512,16 +522,9 @@ void merkle_root_hash(const uint8_t *data, size_t len,
         sha256(page, PAGE, cur + i * H);
     }
     if (npages == 1) { memcpy(root, cur, H); free(cur); return; }
-    size_t ncur = npages; int owns = 1;
-    for (;;) {
+    size_t ncur = npages;
+    while (ncur * H > PAGE) {
         size_t packed = ncur * H;
-        if (packed <= PAGE) {
-            memset(page, 0, PAGE);
-            memcpy(page, cur, packed);
-            sha256(page, PAGE, root);
-            if (owns) free(cur);
-            return;
-        }
         size_t next_pages = (packed + PAGE - 1) / PAGE;
         uint8_t *next = malloc(next_pages * H);
         for (size_t i = 0; i < next_pages; i++) {
@@ -531,9 +534,25 @@ void merkle_root_hash(const uint8_t *data, size_t len,
             memcpy(page, cur + off, n);
             sha256(page, PAGE, next + i * H);
         }
-        if (owns) free(cur);
-        cur = next; ncur = next_pages; owns = 1;
+        if (next_pages * H > PAGE) {
+            /* 中间层暂存: 低于根所在层的各层, 从低往高拼接
+               (根所在层 packed <= 4096 不属于中间层) */
+            uint8_t *grown = realloc(mid, mid_len + next_pages * H);
+            if (grown) {
+                mid = grown;
+                memcpy(mid + mid_len, next, next_pages * H);
+                mid_len += next_pages * H;
+            }
+        }
+        free(cur);
+        cur = next; ncur = next_pages;
     }
+    memset(page, 0, PAGE);
+    memcpy(page, cur, ncur * H);
+    sha256(page, PAGE, root);
+    free(cur);
+    *mid_out = mid;
+    *mid_len_out = mid_len;
 }
 
 /*
@@ -609,9 +628,10 @@ int sign_elf(const uint8_t *elf, size_t elf_len, int force,
     }
     free(buf);
 
-    /* 2. merkle 根哈希: 跳过 [cs_off, cs_off+4096) */
+    /* 2. merkle 根哈希: 跳过 [cs_off, cs_off+4096); mid 为中间层哈希 */
     uint8_t root[32];
-    merkle_root_hash(tmp, tmp_len, cs_off, PAGE_SIZE, root);
+    uint8_t *mid = NULL; size_t mid_len = 0;
+    merkle_root_hash(tmp, tmp_len, cs_off, PAGE_SIZE, root, &mid, &mid_len);
 
     /* 3/4. descriptor(signSize=0) 用于摘要, fileSize = 产物长度 */
     uint8_t desc_for_digest[256];
@@ -632,9 +652,14 @@ int sign_elf(const uint8_t *elf, size_t elf_len, int force,
     memcpy(payload + 8, desc_on_disk, DESC_SIZE);
     memcpy(payload + 8 + DESC_SIZE, signature, 32);
 
-    /* 8. 原地写入段内 */
-    if (cs_off + sizeof(payload) > tmp_len) { free(tmp); return -1; }
+    /* 8. 原地写入段内: payload 之后紧跟中间层哈希, 可用容量
+       4096-296=3800B, 中间层更长时保留靠叶层一侧的前 3800B */
+    if (cs_off + sizeof(payload) > tmp_len) { free(mid); free(tmp); return -1; }
     memcpy(tmp + cs_off, payload, sizeof(payload));
+    size_t tail = mid_len;
+    if (tail > PAGE_SIZE - sizeof(payload)) tail = PAGE_SIZE - sizeof(payload);
+    if (tail) memcpy(tmp + cs_off + sizeof(payload), mid, tail);
+    free(mid);
 
     *out = tmp;
     *out_len = tmp_len;

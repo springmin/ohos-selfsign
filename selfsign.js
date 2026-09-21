@@ -302,9 +302,12 @@ function injectCodesignSection(elf) {
 }
 
 function merkleRootHash(data, cs_off, cs_len) {
-  // fs-verity Merkle 树根哈希
+  // fs-verity Merkle 树根哈希 + 中间层哈希.
+  // 返回 { root, mid }; mid = 叶层与根所在层之间的所有层, 从低往高逐层
+  // 把 32B 哈希按顺序拼接 (叶层 <= 4096B 时不存在中间层), 签名时写入
+  // .codesign 段内 payload 之后.
   if (data.length === 0) {
-    return sha256(Buffer.alloc(PAGE_SIZE));
+    return { root: sha256(Buffer.alloc(PAGE_SIZE)), mid: Buffer.alloc(0) };
   }
 
   const npages = Math.ceil(data.length / PAGE_SIZE);
@@ -325,15 +328,12 @@ function merkleRootHash(data, cs_off, cs_len) {
   }
 
   if (npages === 1) {
-    return Buffer.from(hashes[0]);
+    return { root: Buffer.from(hashes[0]), mid: Buffer.alloc(0) };
   }
 
   let cur = Buffer.concat(hashes);
-  for (;;) {
-    if (cur.length <= PAGE_SIZE) {
-      const page = Buffer.concat([cur, Buffer.alloc(PAGE_SIZE - cur.length)]);
-      return sha256(page);
-    }
+  const mid = []; // 中间层暂存: 低于根所在层的各层, 从低往高拼接
+  while (cur.length > PAGE_SIZE) {
     const nxt = [];
     for (let i = 0; i < cur.length; i += PAGE_SIZE) {
       let page = cur.slice(i, i + PAGE_SIZE);
@@ -343,7 +343,12 @@ function merkleRootHash(data, cs_off, cs_len) {
       nxt.push(sha256(page));
     }
     cur = Buffer.concat(nxt);
+    if (cur.length > PAGE_SIZE) {
+      mid.push(cur); // 根所在层 (packed <= 4096) 不属于中间层
+    }
   }
+  const page = Buffer.concat([cur, Buffer.alloc(PAGE_SIZE - cur.length)]);
+  return { root: sha256(page), mid: Buffer.concat(mid) };
 }
 
 function buildDescriptor(sign_size, file_size, root, flags) {
@@ -388,8 +393,8 @@ function signElf(elf, force) {
   const { out: tmp0, cs_off } = injectCodesignSection(buf);
   const file_size = tmp0.length;
 
-  // 2. merkle 根哈希
-  const root = merkleRootHash(tmp0, cs_off, PAGE_SIZE);
+  // 2. merkle 根哈希; mid 为中间层哈希
+  const { root, mid } = merkleRootHash(tmp0, cs_off, PAGE_SIZE);
 
   // 3/4. descriptor(signSize=0) 用于摘要
   const desc_for_digest = buildDescriptor(0, file_size, root, FLAG_SELF_SIGN);
@@ -405,8 +410,10 @@ function signElf(elf, force) {
   desc_on_disk.copy(payload, 8);
   signature.copy(payload, 8 + DESC_SIZE);
 
-  // 8. 原地写入段内
+  // 8. 原地写入段内: payload 之后紧跟中间层哈希, 可用容量
+  // 4096-296=3800B, 中间层更长时保留靠叶层一侧的前 3800B
   payload.copy(tmp0, cs_off);
+  mid.copy(tmp0, cs_off + payload.length, 0, PAGE_SIZE - payload.length);
   return tmp0;
 }
 

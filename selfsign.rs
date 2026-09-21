@@ -439,9 +439,13 @@ fn inject_codesign_section(elf: &[u8]) -> Result<(Vec<u8>, usize), String> {
     Ok((buf, cs_off))
 }
 
-fn merkle_root_hash(data: &[u8], cs_off: usize, cs_len: usize) -> [u8; 32] {
+// merkle_root_hash — fs-verity Merkle 树根哈希 + 中间层哈希.
+// 返回 (根哈希, 中间层); 中间层 = 叶层与根所在层之间的所有层, 从低往高
+// 逐层把 32B 哈希按顺序拼接 (叶层 <= 4096B 时不存在中间层), 签名时写入
+// .codesign 段内 payload 之后.
+fn merkle_root_hash(data: &[u8], cs_off: usize, cs_len: usize) -> ([u8; 32], Vec<u8>) {
     if data.is_empty() {
-        return sha256(&[0u8; PAGE_SIZE]);
+        return (sha256(&[0u8; PAGE_SIZE]), Vec::new());
     }
 
     let npages = data.len().div_ceil(PAGE_SIZE);
@@ -468,17 +472,13 @@ fn merkle_root_hash(data: &[u8], cs_off: usize, cs_len: usize) -> [u8; 32] {
     if npages == 1 {
         let mut root = [0u8; 32];
         root.copy_from_slice(&hashes[0..HASH_OUT]);
-        return root;
+        return (root, Vec::new());
     }
 
     let mut cur = hashes;
-    loop {
+    let mut mid = Vec::new(); // 中间层暂存: 低于根所在层的各层, 从低往高拼接
+    while cur.len() > PAGE_SIZE {
         let packed = cur.len();
-        if packed <= PAGE_SIZE {
-            let mut page = vec![0u8; PAGE_SIZE];
-            page[0..packed].copy_from_slice(&cur);
-            return sha256(&page);
-        }
         let next_pages = packed.div_ceil(PAGE_SIZE);
         let mut next = Vec::with_capacity(next_pages * HASH_OUT);
         for i in 0..next_pages {
@@ -492,8 +492,14 @@ fn merkle_root_hash(data: &[u8], cs_off: usize, cs_len: usize) -> [u8; 32] {
             page[0..n].copy_from_slice(&cur[off..off + n]);
             next.extend_from_slice(&sha256(&page));
         }
+        if next.len() > PAGE_SIZE {
+            mid.extend_from_slice(&next); // 根所在层 (packed <= 4096) 不属于中间层
+        }
         cur = next;
     }
+    let mut page = vec![0u8; PAGE_SIZE];
+    page[0..cur.len()].copy_from_slice(&cur);
+    (sha256(&page), mid)
 }
 
 fn build_descriptor(
@@ -532,8 +538,8 @@ fn sign_elf(elf: &[u8], force: bool) -> Result<Vec<u8>, String> {
     let (tmp0, cs_off) = inject_codesign_section(&buf)?;
     let file_size = tmp0.len() as u64;
 
-    // 2. merkle 根哈希
-    let root = merkle_root_hash(&tmp0, cs_off, PAGE_SIZE);
+    // 2. merkle 根哈希; mid 为中间层哈希
+    let (root, mid) = merkle_root_hash(&tmp0, cs_off, PAGE_SIZE);
 
     // 3/4. descriptor(signSize=0) 用于摘要
     let desc_for_digest = build_descriptor(0, file_size, &root, FLAG_SELF_SIGN);
@@ -549,9 +555,12 @@ fn sign_elf(elf: &[u8], force: bool) -> Result<Vec<u8>, String> {
     payload[8..8 + DESC_SIZE].copy_from_slice(&desc_on_disk);
     payload[8 + DESC_SIZE..8 + DESC_SIZE + HASH_OUT].copy_from_slice(&signature);
 
-    // 8. 原地写入段内
+    // 8. 原地写入段内: payload 之后紧跟中间层哈希, 可用容量
+    // 4096-296=3800B, 中间层更长时保留靠叶层一侧的前 3800B
     let mut tmp = tmp0;
     tmp[cs_off..cs_off + payload.len()].copy_from_slice(&payload);
+    let tail = mid.len().min(PAGE_SIZE - payload.len());
+    tmp[cs_off + payload.len()..cs_off + payload.len() + tail].copy_from_slice(&mid[..tail]);
     Ok(tmp)
 }
 

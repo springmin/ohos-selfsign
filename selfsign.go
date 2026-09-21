@@ -301,9 +301,13 @@ func injectCodesignSection(elf []byte) ([]byte, int, error) {
 	return buf, csOff, nil
 }
 
-func merkleRootHash(data []byte, csOff, csLen int) [32]byte {
+// merkleRootHash 计算 fs-verity Merkle 树根哈希, 并顺带暂存中间层哈希.
+// 中间层 = 叶层与根所在层之间的所有层, 从低往高逐层把 32B 哈希按顺序
+// 拼接 (叶层 <= 4096B 时不存在中间层), 签名时写入 .codesign 段内
+// payload 之后.
+func merkleRootHash(data []byte, csOff, csLen int) ([32]byte, []byte) {
 	if len(data) == 0 {
-		return doSha256(make([]byte, pageSize))
+		return doSha256(make([]byte, pageSize)), nil
 	}
 
 	npages := (len(data) + pageSize - 1) / pageSize
@@ -330,17 +334,13 @@ func merkleRootHash(data []byte, csOff, csLen int) [32]byte {
 	if npages == 1 {
 		var root [32]byte
 		copy(root[:], hashes[:hashOut])
-		return root
+		return root, nil
 	}
 
 	cur := hashes
-	for {
+	var mid []byte // 中间层暂存: 低于根所在层的各层, 从低往高拼接
+	for len(cur) > pageSize {
 		packed := len(cur)
-		if packed <= pageSize {
-			page := make([]byte, pageSize)
-			copy(page, cur)
-			return doSha256(page)
-		}
 		nextPages := (packed + pageSize - 1) / pageSize
 		next := make([]byte, 0, nextPages*hashOut)
 		for i := 0; i < nextPages; i++ {
@@ -354,8 +354,14 @@ func merkleRootHash(data []byte, csOff, csLen int) [32]byte {
 			sum := doSha256(page)
 			next = append(next, sum[:]...)
 		}
+		if len(next) > pageSize {
+			mid = append(mid, next...) // 根所在层 (packed <= 4096) 不属于中间层
+		}
 		cur = next
 	}
+	page := make([]byte, pageSize)
+	copy(page, cur)
+	return doSha256(page), mid
 }
 
 func buildDescriptor(signSize uint32, fileSize uint64, root [32]byte, flags uint32) [descSize]byte {
@@ -398,8 +404,8 @@ func signElf(elf []byte, force bool) ([]byte, error) {
 	}
 	fileSize := uint64(len(tmp0))
 
-	// 2. merkle 根哈希
-	root := merkleRootHash(tmp0, csOff, pageSize)
+	// 2. merkle 根哈希; mid 为中间层哈希
+	root, mid := merkleRootHash(tmp0, csOff, pageSize)
 
 	// 3/4. descriptor(signSize=0) 用于摘要
 	descForDigest := buildDescriptor(0, fileSize, root, flagSelfSign)
@@ -415,9 +421,15 @@ func signElf(elf []byte, force bool) ([]byte, error) {
 	copy(payload[8:], descOnDisk[:])
 	copy(payload[8+descSize:], signature[:])
 
-	// 8. 原地写入段内
+	// 8. 原地写入段内: payload 之后紧跟中间层哈希, 可用容量
+	// 4096-296=3800B, 中间层更长时保留靠叶层一侧的前 3800B
 	tmp := tmp0
 	copy(tmp[csOff:], payload)
+	tail := mid
+	if len(tail) > pageSize-len(payload) {
+		tail = tail[:pageSize-len(payload)]
+	}
+	copy(tmp[csOff+len(payload):], tail)
 	return tmp, nil
 }
 
