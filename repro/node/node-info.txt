@@ -1,0 +1,13 @@
+official-signed reference: Harmonybrew node 26.8.1
+path    : /storage/Users/currentUser/.harmonybrew/Cellar/node/26.8.1_3/bin/node
+size    : 106756384
+md5     : dcbe6d4601241cdf11e993934c4542ba
+sha256  : ccb38f399095134d9111d3e04fce6f12040b0d9a38659352d6f26d59f38893c3
+.codesign offset: 106749952 size: 4096
+segment sha256  : 4c4fb26108f35cea234aa6d47ad4fd4f1014a1312cab5f28c48d50eed98a1b81
+ElfSignInfo: type=1 length=288
+descriptor signSize=32 fileSize=106756384
+rootHash        : be0d3a44f425fc50ac79eb0bfa01ffb999d6b4be220fb4c8d407d690ec856ef7
+signature       : 922905f81467dce4c13c593694c9aa6f55213958a12df6ff2bf03380598e81c8
+tail (payload之后 3800B) md5: 19b5062130618b3a81fc2ae13f863d85
+tail nonzero bytes: 3791
