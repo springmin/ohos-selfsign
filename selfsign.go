@@ -9,14 +9,16 @@
  *
  * 用法:
  *     go build -o selfsign selfsign.go
- *     ./selfsign <input_elf> [output_elf] [--force] [--strip]
+ *     ./selfsign <input_elf> [output_elf] [--force] [--strip] [--check]
  *         缺省 output 时, inplace 改写 input.
  *         --force : 若已含 .codesign 段, 先剥离再重签
  *         --strip : 仅剥离 .codesign 段, 不做签名
+ *         --check : 只读校验已有自签名的有效性, 不写任何文件
  */
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
@@ -433,6 +435,85 @@ func signElf(elf []byte, force bool) ([]byte, error) {
 	return tmp, nil
 }
 
+// ─────────────────── 只读校验 (--check) ───────────────────
+
+// checkSelfsign 只读校验已有自签名的有效性 (--check 的实现).
+//
+// 校验项 (全部通过才算有效; 多项不符时按序报告第一个):
+//  1. 可解析的 ELF64 (走 parseElfHeader 的全部检查), 存在 .codesign 段,
+//     且段内 ElfSignInfo 头 type=1 / length=288
+//  2. descriptor 固定字段: version=1, hashAlgorithm=1, log2BlockSize=12,
+//     csVersion=3
+//  3. signSize=32 且 fileSize=文件实际大小
+//  4. 存储的 merkle 根哈希 == 对整个文件重算的根
+//  5. 存储的 signature == SHA256(signSize 置 0 后的 descriptor)
+//
+// 明确不校验 merkle 中间层 (payload 296B 之后的区域): .codesign 段覆盖
+// 的页在 merkle 叶层本来就置 0, 篡改中间层不影响根, 此类篡改下本校验
+// 仍通过 (预期行为).
+//
+// 返回 (ok, reason); ok 为 false 时 reason 为原因串 (文案五个实现统一).
+func checkSelfsign(elf []byte) (bool, string) {
+	// 1a. ELF64 预检 (parse 失败含段表不可用)
+	h, err := parseElfHeader(elf)
+	if err != nil {
+		return false, "not ELF64"
+	}
+
+	// 1b. 定位 .codesign 段, 段内至少要容得下 296B payload
+	csEntryOff := findSectionByName(elf, h, codesignName)
+	if csEntryOff < 0 {
+		return false, "no .codesign section"
+	}
+	csOff := readU64(elf, int(csEntryOff)+24)
+	csSize := readU64(elf, int(csEntryOff)+32)
+	const payloadLen = 8 + descSize + hashOut
+	if csSize < payloadLen || csOff > uint64(len(elf)) || payloadLen > uint64(len(elf))-csOff {
+		return false, "bad ElfSignInfo header"
+	}
+
+	// 1c. ElfSignInfo 头: type=1, length=288
+	if readU32(elf, int(csOff)) != fsVerityDescriptorType ||
+		readU32(elf, int(csOff)+4) != uint32(descSize+hashOut) {
+		return false, "bad ElfSignInfo header"
+	}
+
+	desc := elf[int(csOff)+8 : int(csOff)+8+descSize]
+	sig := elf[int(csOff)+8+descSize : int(csOff)+payloadLen]
+
+	// 2. descriptor 固定字段: version/hashAlgorithm/log2BlockSize/csVersion
+	if desc[0] != 1 || desc[1] != 1 || desc[2] != 12 || desc[255] != 3 {
+		return false, "unsupported descriptor fields"
+	}
+
+	// 3. signSize=32 且 fileSize=文件实际大小
+	if readU32(desc, 4) != hashOut {
+		return false, "signSize mismatch"
+	}
+	if readU64(desc, 8) != uint64(len(elf)) {
+		return false, "fileSize mismatch"
+	}
+
+	// 4. merkle 根哈希: 重算整个文件的根 (中间层忽略)
+	root, _ := merkleRootHash(elf, int(csOff), pageSize)
+	if !bytes.Equal(desc[16:16+hashOut], root[:]) {
+		return false, "merkle root mismatch"
+	}
+
+	// 5. signature == SHA256(signSize 置 0 后的 descriptor)
+	desc0 := make([]byte, descSize)
+	copy(desc0, desc)
+	for i := 4; i < 8; i++ {
+		desc0[i] = 0
+	}
+	expect := doSha256(desc0)
+	if !bytes.Equal(sig, expect[:]) {
+		return false, "signature mismatch"
+	}
+
+	return true, ""
+}
+
 // ─────────────────── 文件 I/O 层 ───────────────────
 func signFileAtomic(path string, force bool) error {
 	raw, err := os.ReadFile(path)
@@ -468,24 +549,45 @@ func main() {
 	args := os.Args[1:]
 	force := false
 	stripOnly := false
+	checkOnly := false
 	var positional []string
 	for _, a := range args {
 		if a == "--force" || a == "-f" {
 			force = true
 		} else if a == "--strip" {
 			stripOnly = true
+		} else if a == "--check" {
+			checkOnly = true
 		} else {
 			positional = append(positional, a)
 		}
 	}
-	if len(positional) < 1 || len(positional) > 2 {
-		fmt.Fprintf(os.Stderr, "usage: %s <input_elf> [output_elf] [--force] [--strip]\n  (output defaults to input, in-place)\n", os.Args[0])
+	// --check 与输出路径/--force/--strip 组合属用法错误
+	if len(positional) < 1 || len(positional) > 2 ||
+		(checkOnly && (force || stripOnly || len(positional) == 2)) {
+		fmt.Fprintf(os.Stderr, "usage: %s <input_elf> [output_elf] [--force] [--strip] [--check]\n  (output defaults to input, in-place)\n", os.Args[0])
 		os.Exit(1)
 	}
 	inPath := positional[0]
 	outPath := inPath
 	if len(positional) == 2 {
 		outPath = positional[1]
+	}
+
+	if checkOnly {
+		// --check: 只读校验, 不写任何文件
+		raw, err := os.ReadFile(inPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(2)
+		}
+		ok, reason := checkSelfsign(raw)
+		if ok {
+			fmt.Printf("check ok: %s\n", inPath)
+			return
+		}
+		fmt.Fprintf(os.Stderr, "check failed: %s (%s)\n", inPath, reason)
+		os.Exit(1)
 	}
 
 	if stripOnly {

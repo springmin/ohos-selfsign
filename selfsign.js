@@ -9,10 +9,11 @@
  * selfsign.js — 轻量级 OpenHarmony 二进制自签名工具
  *
  * 用法:
- *     node selfsign.js <input_elf> [output_elf] [--force] [--strip]
+ *     node selfsign.js <input_elf> [output_elf] [--force] [--strip] [--check]
  *         缺省 output 时, inplace 改写 input.
  *         --force : 若已含 .codesign 段, 先剥离再重签
  *         --strip : 仅剥离 .codesign 段, 不做签名
+ *         --check : 只读校验已有自签名的有效性, 不写任何文件
  */
 "use strict";
 
@@ -417,6 +418,89 @@ function signElf(elf, force) {
   return tmp0;
 }
 
+// ─────────────────── 只读校验 (--check) ───────────────────
+function checkSelfsign(elf) {
+  // 只读校验已有自签名的有效性 (--check 的实现).
+  // 校验项 (全部通过才算有效; 多项不符时按序报告第一个):
+  //   1. 可解析的 ELF64 (走 parseElfHeader 的全部检查), 存在 .codesign 段,
+  //      且段内 ElfSignInfo 头 type=1 / length=288
+  //   2. descriptor 固定字段: version=1, hashAlgorithm=1, log2BlockSize=12,
+  //      csVersion=3
+  //   3. signSize=32 且 fileSize=文件实际大小
+  //   4. 存储的 merkle 根哈希 == 对整个文件重算的根
+  //   5. 存储的 signature == SHA256(signSize 置 0 后的 descriptor)
+  // 明确不校验 merkle 中间层 (payload 296B 之后的区域): .codesign 段覆盖
+  // 的页在 merkle 叶层本来就置 0, 篡改中间层不影响根, 此类篡改下本校验
+  // 仍通过 (预期行为).
+  // 返回 { ok, reason }; ok 为 false 时 reason 为原因串 (文案五个实现统一).
+
+  // 1a. ELF64 预检 (parse 失败含段表不可用)
+  let hdr;
+  try {
+    hdr = parseElfHeader(elf);
+  } catch (e) {
+    return { ok: false, reason: "not ELF64" };
+  }
+
+  // 1b. 定位 .codesign 段, 段内至少要容得下 296B payload
+  const cs_entry_off = findSectionByName(
+    elf,
+    hdr.e_shoff,
+    hdr.e_shentsize,
+    hdr.e_shnum,
+    hdr.e_shstrndx,
+    CODESIGN_NAME,
+  );
+  if (cs_entry_off < 0) {
+    return { ok: false, reason: "no .codesign section" };
+  }
+  const cs_off = readU64(elf, cs_entry_off + 24);
+  const cs_size = readU64(elf, cs_entry_off + 32);
+  const payload_len = 8 + DESC_SIZE + HASH_OUT;
+  if (cs_size < payload_len || cs_off + payload_len > elf.length) {
+    return { ok: false, reason: "bad ElfSignInfo header" };
+  }
+
+  // 1c. ElfSignInfo 头: type=1, length=288
+  if (
+    readU32(elf, cs_off) !== FS_VERITY_DESCRIPTOR_TYPE ||
+    readU32(elf, cs_off + 4) !== DESC_SIZE + HASH_OUT
+  ) {
+    return { ok: false, reason: "bad ElfSignInfo header" };
+  }
+
+  const desc = elf.slice(cs_off + 8, cs_off + 8 + DESC_SIZE);
+  const sig = elf.slice(cs_off + 8 + DESC_SIZE, cs_off + payload_len);
+
+  // 2. descriptor 固定字段: version/hashAlgorithm/log2BlockSize/csVersion
+  if (desc[0] !== 1 || desc[1] !== 1 || desc[2] !== 12 || desc[255] !== 3) {
+    return { ok: false, reason: "unsupported descriptor fields" };
+  }
+
+  // 3. signSize=32 且 fileSize=文件实际大小
+  if (readU32(desc, 4) !== HASH_OUT) {
+    return { ok: false, reason: "signSize mismatch" };
+  }
+  if (readU64(desc, 8) !== elf.length) {
+    return { ok: false, reason: "fileSize mismatch" };
+  }
+
+  // 4. merkle 根哈希: 重算整个文件的根 (中间层忽略)
+  const { root } = merkleRootHash(elf, cs_off, PAGE_SIZE);
+  if (!desc.slice(16, 16 + HASH_OUT).equals(root)) {
+    return { ok: false, reason: "merkle root mismatch" };
+  }
+
+  // 5. signature == SHA256(signSize 置 0 后的 descriptor)
+  const desc0 = Buffer.from(desc);
+  desc0.fill(0, 4, 8);
+  if (!sig.equals(sha256(desc0))) {
+    return { ok: false, reason: "signature mismatch" };
+  }
+
+  return { ok: true, reason: null };
+}
+
 // ─────────────────── 文件 I/O 层 ───────────────────
 function signFileAtomic(path, force) {
   const raw = fs.readFileSync(path);
@@ -443,15 +527,22 @@ function signFileAtomic(path, force) {
 function main() {
   let force = false;
   let strip_only = false;
+  let check_only = false;
   const positional = [];
   for (const a of process.argv.slice(2)) {
     if (a === "--force" || a === "-f") force = true;
     else if (a === "--strip") strip_only = true;
+    else if (a === "--check") check_only = true;
     else positional.push(a);
   }
-  if (positional.length < 1 || positional.length > 2) {
+  // --check 与输出路径/--force/--strip 组合属用法错误
+  if (
+    positional.length < 1 ||
+    positional.length > 2 ||
+    (check_only && (force || strip_only || positional.length === 2))
+  ) {
     process.stderr.write(
-      `usage: ${process.argv[1]} <input_elf> [output_elf] [--force] [--strip]\n` +
+      `usage: ${process.argv[1]} <input_elf> [output_elf] [--force] [--strip] [--check]\n` +
         "  (output defaults to input, in-place)\n",
     );
     return 1;
@@ -460,6 +551,18 @@ function main() {
   const out_path = positional.length === 2 ? positional[1] : in_path;
 
   try {
+    if (check_only) {
+      // --check: 只读校验, 不写任何文件
+      const raw = fs.readFileSync(in_path);
+      const { ok, reason } = checkSelfsign(raw);
+      if (ok) {
+        console.log(`check ok: ${in_path}`);
+        return 0;
+      }
+      process.stderr.write(`check failed: ${in_path} (${reason})\n`);
+      return 1;
+    }
+
     if (strip_only) {
       const raw = fs.readFileSync(in_path);
       const { removed, out } = stripCodesign(Buffer.from(raw));
@@ -509,6 +612,7 @@ module.exports = {
   stripCodesign,     // (buf: Buffer) => { removed: boolean, out: Buffer }
   hasCodesignSection,// (elf: Buffer) => boolean
   injectCodesignSection, // (elf: Buffer) => { out: Buffer, cs_off: number }
+  checkSelfsign,     // (elf: Buffer) => { ok: boolean, reason: string|null }  只读校验自签名
   // 算法核心（导出便于复用/测试）
   merkleRootHash,
   buildDescriptor,

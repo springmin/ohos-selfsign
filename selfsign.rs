@@ -9,10 +9,11 @@
  *
  * 用法:
  *     rustc -O selfsign.rs -o selfsign
- *     ./selfsign <input_elf> [output_elf] [--force] [--strip]
+ *     ./selfsign <input_elf> [output_elf] [--force] [--strip] [--check]
  *         缺省 output 时, inplace 改写 input.
  *         --force : 若已含 .codesign 段, 先剥离再重签
  *         --strip : 仅剥离 .codesign 段, 不做签名
+ *         --check : 只读校验已有自签名的有效性, 不写任何文件
  */
 
 use std::env;
@@ -564,6 +565,88 @@ fn sign_elf(elf: &[u8], force: bool) -> Result<Vec<u8>, String> {
     Ok(tmp)
 }
 
+/* ─────────────────── 只读校验 (--check) ─────────────────── */
+
+// check_selfsign — 只读校验已有自签名的有效性 (--check 的实现).
+//
+// 校验项 (全部通过才算有效; 多项不符时按序报告第一个):
+//   1. 可解析的 ELF64 (走 parse_elf_header 的全部检查), 存在 .codesign 段,
+//      且段内 ElfSignInfo 头 type=1 / length=288
+//   2. descriptor 固定字段: version=1, hashAlgorithm=1, log2BlockSize=12,
+//      csVersion=3
+//   3. signSize=32 且 fileSize=文件实际大小
+//   4. 存储的 merkle 根哈希 == 对整个文件重算的根
+//   5. 存储的 signature == SHA256(signSize 置 0 后的 descriptor)
+//
+// 明确不校验 merkle 中间层 (payload 296B 之后的区域): .codesign 段覆盖
+// 的页在 merkle 叶层本来就置 0, 篡改中间层不影响根, 此类篡改下本校验
+// 仍通过 (预期行为).
+//
+// 返回 Ok(()) = 有效; Err(reason) = 无效, reason 为原因串 (文案五个实现统一).
+fn check_selfsign(elf: &[u8]) -> Result<(), &'static str> {
+    // 1a. ELF64 预检 (parse 失败含段表不可用)
+    let (e_shoff, e_shentsize, e_shnum, e_shstrndx) =
+        parse_elf_header(elf).map_err(|_| "not ELF64")?;
+
+    // 1b. 定位 .codesign 段, 段内至少要容得下 296B payload
+    let cs_entry_off =
+        find_section_by_name(elf, e_shoff, e_shentsize, e_shnum, e_shstrndx, CODESIGN_NAME);
+    if cs_entry_off < 0 {
+        return Err("no .codesign section");
+    }
+    let cs_off = read_u64(elf, cs_entry_off as usize + 24);
+    let cs_size = read_u64(elf, cs_entry_off as usize + 32);
+    let payload_len = 8 + DESC_SIZE + HASH_OUT;
+    if cs_size < payload_len as u64
+        || cs_off > elf.len() as u64
+        || (payload_len as u64) > elf.len() as u64 - cs_off
+    {
+        return Err("bad ElfSignInfo header");
+    }
+    let cs_off = cs_off as usize;
+
+    // 1c. ElfSignInfo 头: type=1, length=288
+    if read_u32(elf, cs_off) != FS_VERITY_DESCRIPTOR_TYPE
+        || read_u32(elf, cs_off + 4) != (DESC_SIZE + HASH_OUT) as u32
+    {
+        return Err("bad ElfSignInfo header");
+    }
+
+    let desc = &elf[cs_off + 8..cs_off + 8 + DESC_SIZE];
+    let sig = &elf[cs_off + 8 + DESC_SIZE..cs_off + payload_len];
+
+    // 2. descriptor 固定字段: version/hashAlgorithm/log2BlockSize/csVersion
+    if desc[0] != 1 || desc[1] != 1 || desc[2] != 12 || desc[255] != 3 {
+        return Err("unsupported descriptor fields");
+    }
+
+    // 3. signSize=32 且 fileSize=文件实际大小
+    if read_u32(desc, 4) != HASH_OUT as u32 {
+        return Err("signSize mismatch");
+    }
+    if read_u64(desc, 8) != elf.len() as u64 {
+        return Err("fileSize mismatch");
+    }
+
+    // 4. merkle 根哈希: 重算整个文件的根 (中间层忽略)
+    let (root, _mid) = merkle_root_hash(elf, cs_off, PAGE_SIZE);
+    if desc[16..16 + HASH_OUT] != root {
+        return Err("merkle root mismatch");
+    }
+
+    // 5. signature == SHA256(signSize 置 0 后的 descriptor)
+    let mut desc0 = [0u8; DESC_SIZE];
+    desc0.copy_from_slice(desc);
+    for b in &mut desc0[4..8] {
+        *b = 0;
+    }
+    if sig != sha256(&desc0) {
+        return Err("signature mismatch");
+    }
+
+    Ok(())
+}
+
 /* ─────────────────── 文件 I/O 层 ─────────────────── */
 fn sign_file_atomic(path: &str, force: bool) -> Result<(), String> {
     let raw = fs::read(path).map_err(|e| e.to_string())?;
@@ -600,19 +683,26 @@ fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     let mut force = false;
     let mut strip_only = false;
+    let mut check_only = false;
     let mut positional: Vec<&str> = Vec::new();
     for a in &args {
         if a == "--force" || a == "-f" {
             force = true;
         } else if a == "--strip" {
             strip_only = true;
+        } else if a == "--check" {
+            check_only = true;
         } else {
             positional.push(a);
         }
     }
-    if positional.is_empty() || positional.len() > 2 {
+    // --check 与输出路径/--force/--strip 组合属用法错误
+    if positional.is_empty()
+        || positional.len() > 2
+        || (check_only && (force || strip_only || positional.len() == 2))
+    {
         eprintln!(
-            "usage: {} <input_elf> [output_elf] [--force] [--strip]\n  (output defaults to input, in-place)",
+            "usage: {} <input_elf> [output_elf] [--force] [--strip] [--check]\n  (output defaults to input, in-place)",
             env::args().next().unwrap_or_else(|| "selfsign".to_string())
         );
         process::exit(1);
@@ -625,6 +715,21 @@ fn main() {
     };
 
     let result: Result<i32, String> = (|| {
+        if check_only {
+            // --check: 只读校验, 不写任何文件
+            let raw = fs::read(in_path).map_err(|e| e.to_string())?;
+            match check_selfsign(&raw) {
+                Ok(()) => {
+                    println!("check ok: {}", in_path);
+                    return Ok(0);
+                }
+                Err(reason) => {
+                    eprintln!("check failed: {} ({})", in_path, reason);
+                    return Ok(1);
+                }
+            }
+        }
+
         if strip_only {
             let raw = fs::read(in_path).map_err(|e| e.to_string())?;
             let (removed, out) = strip_codesign(&raw)?;

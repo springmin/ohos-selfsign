@@ -9,10 +9,11 @@
 selfsign.py — 轻量级 OpenHarmony 二进制自签名工具
 
 用法:
-    python3 selfsign.py <input_elf> [output_elf] [--force] [--strip]
+    python3 selfsign.py <input_elf> [output_elf] [--force] [--strip] [--check]
         缺省 output 时, inplace 改写 input.
         --force : 若已含 .codesign 段, 先剥离再重签
         --strip : 仅剥离 .codesign 段, 不做签名
+        --check : 只读校验已有自签名的有效性, 不写任何文件
 
 ─────────────────────────────────────────────────────────────
 函数划分说明:
@@ -29,6 +30,7 @@ selfsign.py — 轻量级 OpenHarmony 二进制自签名工具
     has_codesign_section — 检测是否已含 .codesign 段 (预检, 只读)
     strip_codesign       — 剥离已有 .codesign 段并重建 SHT/shstrtab
                            (标准化; 纯加签模式下不执行)
+    check_selfsign       — 只读校验已有自签名的有效性 (--check)
 
 三、文件 I/O 层 (与签名算法无关的健壮性):
     sign_file_atomic     — 临时文件 + rename 原子落盘, 保留原权限位
@@ -457,6 +459,74 @@ def sign_elf(elf: bytes, force: bool) -> bytes:
     return bytes(tmp)
 
 
+# ─────────────────── 只读校验 (--check) ───────────────────
+def check_selfsign(elf: bytes) -> tuple[bool, str | None]:
+    """只读校验已有自签名的有效性 (--check 的实现).
+
+    校验项 (全部通过才算有效; 多项不符时按此顺序报告第一个):
+      1. 可解析的 ELF64 (走 parse_elf_header 的全部检查), 存在
+         .codesign 段, 且段内 ElfSignInfo 头 type=1 / length=288
+      2. descriptor 固定字段完好: version=1, hashAlgorithm=1,
+         log2BlockSize=12, csVersion=3
+      3. signSize=32 且 fileSize=文件实际大小
+      4. 存储的 merkle 根哈希 == 对整个文件重算的根
+      5. 存储的 signature == SHA256(signSize 置 0 后的 descriptor)
+
+    明确不校验 merkle 中间层 (payload 296B 之后的区域): 自签名场景内核
+    只验根哈希, 且 .codesign 段覆盖的页在 merkle 叶层本来就置 0, 篡改
+    中间层不影响根, 此类篡改下本校验仍通过 (预期行为).
+
+    返回 (ok, reason); ok 为 False 时 reason 为原因串 (文案五个实现统一).
+    """
+    # 1a. ELF64 预检 (parse 失败含段表不可用)
+    try:
+        e_shoff, e_shentsize, e_shnum, e_shstrndx = parse_elf_header(elf)
+    except ValueError:
+        return False, "not ELF64"
+
+    # 1b. 定位 .codesign 段, 段内至少要容得下 296B payload
+    cs_entry_off = find_section_by_name(elf, e_shoff, e_shentsize, e_shnum,
+                                        e_shstrndx, CODESIGN_NAME)
+    if cs_entry_off < 0:
+        return False, "no .codesign section"
+    cs_off = read_u64(elf, cs_entry_off + 24)
+    cs_size = read_u64(elf, cs_entry_off + 32)
+    payload_len = 8 + DESC_SIZE + HASH_OUT
+    if cs_size < payload_len or cs_off + payload_len > len(elf):
+        return False, "bad ElfSignInfo header"
+
+    # 1c. ElfSignInfo 头: type=1, length=288
+    if (read_u32(elf, cs_off) != FS_VERITY_DESCRIPTOR_TYPE or
+            read_u32(elf, cs_off + 4) != DESC_SIZE + HASH_OUT):
+        return False, "bad ElfSignInfo header"
+
+    desc = elf[cs_off + 8: cs_off + 8 + DESC_SIZE]
+    sig = elf[cs_off + 8 + DESC_SIZE: cs_off + payload_len]
+
+    # 2. descriptor 固定字段: version/hashAlgorithm/log2BlockSize/csVersion
+    if desc[0] != 1 or desc[1] != 1 or desc[2] != 12 or desc[255] != 3:
+        return False, "unsupported descriptor fields"
+
+    # 3. signSize=32 且 fileSize=文件实际大小
+    if read_u32(desc, 4) != HASH_OUT:
+        return False, "signSize mismatch"
+    if read_u64(desc, 8) != len(elf):
+        return False, "fileSize mismatch"
+
+    # 4. merkle 根哈希: 重算整个文件的根 (中间层忽略)
+    root, _mid = merkle_root_hash(elf, cs_off, PAGE_SIZE)
+    if desc[16:16 + HASH_OUT] != root:
+        return False, "merkle root mismatch"
+
+    # 5. signature == SHA256(signSize 置 0 后的 descriptor)
+    desc0 = bytearray(desc)
+    desc0[4:8] = bytes(4)
+    if sig != sha256(bytes(desc0)):
+        return False, "signature mismatch"
+
+    return True, None
+
+
 # ─────────────────── 文件 I/O 层 ───────────────────
 def sign_file_atomic(path: str, force: bool) -> None:
     """对文件原子签名 (文件 I/O 层, 与签名算法无关).
@@ -497,23 +567,38 @@ def _read_file(path: str) -> bytes:
 def main() -> int:
     force = False
     strip_only = False
+    check_only = False
     positional = []
     for a in sys.argv[1:]:
         if a in ("--force", "-f"):
             force = True
         elif a == "--strip":
             strip_only = True
+        elif a == "--check":
+            check_only = True
         else:
             positional.append(a)
-    if len(positional) < 1 or len(positional) > 2:
+    # --check 与输出路径/--force/--strip 组合属用法错误
+    if (len(positional) < 1 or len(positional) > 2 or
+            (check_only and (force or strip_only or len(positional) == 2))):
         sys.stderr.write(
-            f"usage: {sys.argv[0]} <input_elf> [output_elf] [--force] [--strip]\n"
+            f"usage: {sys.argv[0]} <input_elf> [output_elf] [--force] [--strip] [--check]\n"
             "  (output defaults to input, in-place)\n")
         return 1
     in_path = positional[0]
     out_path = positional[1] if len(positional) == 2 else in_path
 
     try:
+        if check_only:
+            # --check: 只读校验, 不写任何文件
+            raw = _read_file(in_path)
+            ok, reason = check_selfsign(raw)
+            if ok:
+                print(f"check ok: {in_path}")
+                return 0
+            sys.stderr.write(f"check failed: {in_path} ({reason})\n")
+            return 1
+
         if strip_only:
             # --strip: 仅预清洗/标准化, 不做签名
             raw = bytearray(_read_file(in_path))

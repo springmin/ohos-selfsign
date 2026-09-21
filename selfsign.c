@@ -11,10 +11,11 @@
  *
  * 用法:
  *     cc selfsign.c -o selfsign
- *     ./selfsign <input_elf> [output_elf] [--force] [--strip]
+ *     ./selfsign <input_elf> [output_elf] [--force] [--strip] [--check]
  *         缺省 output 时, inplace 改写 input.
  *         --force : 若已含 .codesign 段, 先剥离再重签
  *         --strip : 仅剥离 .codesign 段, 不做签名
+ *         --check : 只读校验已有自签名的有效性, 不写任何文件
  *
  * ─────────────────────────────────────────────────────────────
  * 函数划分说明:
@@ -31,6 +32,7 @@
  *     has_codesign_section — 检测是否已含 .codesign 段 (预检, 只读)
  *     strip_codesign       — 剥离已有 .codesign 段并重建 SHT/shstrtab
  *                            (标准化; 纯加签模式下不执行)
+ *     check_selfsign       — 只读校验已有自签名的有效性 (--check)
  *
  * 三、文件 I/O 层 (与签名算法无关的健壮性):
  *     sign_file_atomic     — 临时文件 + rename 原子落盘, 保留原权限位
@@ -185,41 +187,57 @@ static const char CODESIGN_NAME[10] = ".codesign\0";
 /* ─────────────────── ELF 预清洗/标准化 (非签名必需) ─────────────────── */
 
 /*
- * parse_elf_header — 校验并解析 ELF64 header (只读预检).
+ * parse_elf_header_check — 静默核心: 校验并解析 ELF64 header (只读预检).
  *
- * 这不是签名算法的一部分, 而是签名/剥离共用的"先决条件检查":
+ * 检查项:
  *  - 校验魔数 \x7fELF + ELFCLASS64
  *  - 校验 e_shentsize >= 64 (ELF64 允许段表条目大于 64 字节以携带扩展
  *    字段, 故只拒绝小于 64 的; 实际条目大小经 e_shentsize 传出, 后续
  *    所有 SHT 遍历/越界校验均按它步进)
  *  - 校验 SHT 不越界 (checked_add 语义), e_shstrndx < e_shnum
- * 返回 0 表示通过, 输出 e_shoff/e_shentsize/e_shnum/e_shstrndx; 返回 -1
- * 表示不是可处理的 ELF64.
+ * 返回 NULL 表示通过, 输出 e_shoff/e_shentsize/e_shnum/e_shstrndx;
+ * 否则返回错误串 (不打印), 供调用方自行决定如何呈现.
  */
-int parse_elf_header(const uint8_t *elf, size_t elf_len,
-                            uint64_t *e_shoff, uint16_t *e_shentsize,
-                            uint16_t *e_shnum, uint16_t *e_shstrndx) {
+static const char *parse_elf_header_check(const uint8_t *elf, size_t elf_len,
+                                          uint64_t *e_shoff, uint16_t *e_shentsize,
+                                          uint16_t *e_shnum, uint16_t *e_shstrndx) {
     if (elf_len < 64 || memcmp(elf, "\x7f""ELF", 4) != 0 || elf[4] != 2) {
-        fprintf(stderr, "error: not ELF64\n");
-        return -1;
+        return "not ELF64";
     }
     uint64_t shoff = read_u64(elf, elf_len, E_SHOFF);
     uint16_t shentsize = read_u16(elf, elf_len, E_SHENTSIZE);
     uint16_t shnum = read_u16(elf, elf_len, E_SHNUM);
     uint16_t shstrndx = read_u16(elf, elf_len, E_SHSTRNDX);
     if (shentsize < 64 || shoff == 0 || shnum == 0 || (uint64_t)shstrndx >= (uint64_t)shnum) {
-        fprintf(stderr, "error: ELF has no usable section header table\n");
-        return -1;
+        return "ELF has no usable section header table";
     }
     /* SHT 越界检查: e_shoff + e_shnum*e_shentsize 必须落在文件内 (对应 checked_add + 比较) */
     if (shoff > elf_len || shnum > (elf_len - shoff) / shentsize) {
-        fprintf(stderr, "error: section header table out of bounds\n");
-        return -1;
+        return "section header table out of bounds";
     }
     *e_shoff = shoff;
     *e_shentsize = shentsize;
     *e_shnum = shnum;
     *e_shstrndx = shstrndx;
+    return NULL;
+}
+
+/*
+ * parse_elf_header — 校验并解析 ELF64 header (只读预检).
+ *
+ * 这不是签名算法的一部分, 而是签名/剥离共用的"先决条件检查":
+ * parse_elf_header_check 的打印包装, 失败时向 stderr 输出
+ * "error: <错误串>". 返回 0 表示通过; 返回 -1 表示不是可处理的 ELF64.
+ */
+int parse_elf_header(const uint8_t *elf, size_t elf_len,
+                            uint64_t *e_shoff, uint16_t *e_shentsize,
+                            uint16_t *e_shnum, uint16_t *e_shstrndx) {
+    const char *err = parse_elf_header_check(elf, elf_len, e_shoff, e_shentsize,
+                                             e_shnum, e_shstrndx);
+    if (err) {
+        fprintf(stderr, "error: %s\n", err);
+        return -1;
+    }
     return 0;
 }
 
@@ -667,6 +685,88 @@ int sign_elf(const uint8_t *elf, size_t elf_len, int force,
     return 0;
 }
 
+/* ─────────────────── 只读校验 (--check) ─────────────────── */
+
+/*
+ * check_selfsign — 只读校验已有自签名的有效性 (--check 的实现, 只读预检).
+ *
+ * 校验项 (全部通过才算有效; 多项不符时按此顺序报告第一个):
+ *   1. 可解析的 ELF64 (与 parse_elf_header 共享静默核心
+ *      parse_elf_header_check, 不向 stderr 打印), 存在 .codesign 段,
+ *      且段内 ElfSignInfo 头 type=1 / length=288
+ *   2. descriptor 固定字段完好: version=1, hashAlgorithm=1,
+ *      log2BlockSize=12, csVersion=3
+ *   3. signSize=32 且 fileSize=文件实际大小
+ *   4. 存储的 merkle 根哈希 == 对整个文件重算的根
+ *   5. 存储的 signature == SHA256(signSize 置 0 后的 descriptor)
+ *
+ * 明确不校验 merkle 中间层 (payload 296B 之后的区域): 自签名场景内核
+ * 只验根哈希, 且 .codesign 段覆盖的页在 merkle 叶层本来就置 0, 篡改
+ * 中间层不影响根, 此类篡改下本校验仍通过 (预期行为).
+ *
+ * 返回 1 = 有效; 返回 0 = 无效且 *reason 指向静态原因串
+ * (文案五个实现统一).
+ */
+int check_selfsign(const uint8_t *elf, size_t elf_len, const char **reason) {
+    *reason = NULL;
+
+    /* 1a. ELF64 预检 (与 parse_elf_header 共享静默核心;
+     * --check 把所有解析失败统一报 not ELF64) */
+    uint64_t e_shoff; uint16_t e_shentsize, e_shnum, e_shstrndx;
+    if (parse_elf_header_check(elf, elf_len, &e_shoff, &e_shentsize,
+                               &e_shnum, &e_shstrndx) != NULL) {
+        *reason = "not ELF64"; return 0;
+    }
+
+    /* 1b. 定位 .codesign 段, 段内至少要容得下 296B payload */
+    int64_t cs_entry_off = find_section_by_name(elf, elf_len, e_shoff, e_shentsize,
+                                                e_shnum, e_shstrndx, CODESIGN_NAME);
+    if (cs_entry_off < 0) { *reason = "no .codesign section"; return 0; }
+    uint64_t cs_off = read_u64(elf, elf_len, (size_t)cs_entry_off + 24);
+    uint64_t cs_size = read_u64(elf, elf_len, (size_t)cs_entry_off + 32);
+    const size_t payload_len = 8 + DESC_SIZE + 32;
+    if (cs_size < payload_len || cs_off > elf_len || payload_len > elf_len - cs_off) {
+        *reason = "bad ElfSignInfo header"; return 0;
+    }
+
+    /* 1c. ElfSignInfo 头: type=1, length=288 */
+    if (read_u32(elf, elf_len, (size_t)cs_off) != FS_VERITY_DESCRIPTOR_TYPE ||
+        read_u32(elf, elf_len, (size_t)cs_off + 4) != (uint32_t)(DESC_SIZE + 32)) {
+        *reason = "bad ElfSignInfo header"; return 0;
+    }
+
+    const uint8_t *desc = elf + cs_off + 8;
+    const uint8_t *sig = elf + cs_off + 8 + DESC_SIZE;
+
+    /* 2. descriptor 固定字段: version/hashAlgorithm/log2BlockSize/csVersion */
+    if (desc[0] != 1 || desc[1] != 1 || desc[2] != 12 || desc[255] != 3) {
+        *reason = "unsupported descriptor fields"; return 0;
+    }
+
+    /* 3. signSize=32 且 fileSize=文件实际大小 */
+    if (read_u32(desc, DESC_SIZE, 4) != 32) { *reason = "signSize mismatch"; return 0; }
+    if (read_u64(desc, DESC_SIZE, 8) != (uint64_t)elf_len) {
+        *reason = "fileSize mismatch"; return 0;
+    }
+
+    /* 4. merkle 根哈希: 重算整个文件的根 (中间层忽略, mid 算出即弃) */
+    uint8_t root[32];
+    uint8_t *mid = NULL; size_t mid_len = 0;
+    merkle_root_hash(elf, elf_len, cs_off, PAGE_SIZE, root, &mid, &mid_len);
+    free(mid);
+    if (memcmp(desc + 16, root, 32) != 0) { *reason = "merkle root mismatch"; return 0; }
+
+    /* 5. signature == SHA256(signSize 置 0 后的 descriptor) */
+    uint8_t desc0[DESC_SIZE];
+    memcpy(desc0, desc, DESC_SIZE);
+    memset(desc0 + 4, 0, 4);
+    uint8_t expect[32];
+    sha256(desc0, DESC_SIZE, expect);
+    if (memcmp(sig, expect, 32) != 0) { *reason = "signature mismatch"; return 0; }
+
+    return 1;
+}
+
 /* ─────────────────────────── 文件 I/O 层 ─────────────────────────── */
 
 /*
@@ -728,20 +828,45 @@ int sign_file_atomic(const char *path, int force) {
  */
 #ifndef SELFSIGN_AS_LIBRARY
 int main(int argc, char **argv) {
-    int force = 0, strip_only = 0;
+    int force = 0, strip_only = 0, check_only = 0;
     const char *in_path = NULL, *out_path = NULL;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--force") == 0 || strcmp(argv[i], "-f") == 0) force = 1;
         else if (strcmp(argv[i], "--strip") == 0) strip_only = 1;
+        else if (strcmp(argv[i], "--check") == 0) check_only = 1;
         else if (!in_path) in_path = argv[i];
         else if (!out_path) out_path = argv[i];
-        else { fprintf(stderr, "usage: %s <input_elf> [output_elf] [--force] [--strip]\n", argv[0]); return 1; }
+        else { fprintf(stderr, "usage: %s <input_elf> [output_elf] [--force] [--strip] [--check]\n", argv[0]); return 1; }
     }
     if (!in_path) {
-        fprintf(stderr, "usage: %s <input_elf> [output_elf] [--force] [--strip]\n"
+        fprintf(stderr, "usage: %s <input_elf> [output_elf] [--force] [--strip] [--check]\n"
                 "  (output defaults to input, in-place)\n", argv[0]);
         return 1;
     }
+
+    if (check_only) {
+        /* --check: 只读校验, 与输出路径/--force/--strip 组合属用法错误 */
+        if (force || strip_only || out_path) {
+            fprintf(stderr, "usage: %s <input_elf> [output_elf] [--force] [--strip] [--check]\n"
+                    "  (output defaults to input, in-place)\n", argv[0]);
+            return 1;
+        }
+        FILE *f = fopen(in_path, "rb");
+        if (!f) { perror(in_path); return 2; }
+        fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+        if (sz < 0) { fclose(f); return 2; }
+        uint8_t *raw = malloc(sz > 0 ? (size_t)sz : 1);
+        if (!raw) { fclose(f); return 2; }
+        if (sz > 0 && fread(raw, 1, (size_t)sz, f) != (size_t)sz) { free(raw); fclose(f); return 2; }
+        fclose(f);
+        const char *reason = NULL;
+        int ok = check_selfsign(raw, (size_t)sz, &reason);
+        free(raw);
+        if (ok) { printf("check ok: %s\n", in_path); return 0; }
+        fprintf(stderr, "check failed: %s (%s)\n", in_path, reason);
+        return 1;
+    }
+
     if (!out_path) out_path = in_path;
 
     if (strip_only) {
