@@ -75,7 +75,10 @@ function alignUp(v, a) {
 
 // ─────────────────── ELF 预清洗/标准化 (非签名必需) ───────────────────
 function parseElfHeader(elf) {
-  // 校验并解析 ELF64 header (只读预检). 返回 {e_shoff, e_shnum, e_shstrndx}
+  // 校验并解析 ELF64 header (只读预检).
+  // ELF64 允许段表条目大于 64 字节 (携带扩展字段), 故只拒绝小于 64 的;
+  // 实际条目大小随返回值传出, 后续所有 SHT 遍历/越界校验均按它步进.
+  // 返回 {e_shoff, e_shentsize, e_shnum, e_shstrndx}
   if (
     elf.length < 64 ||
     elf[0] !== 0x7f ||
@@ -91,7 +94,7 @@ function parseElfHeader(elf) {
   const e_shnum = readU16(elf, E_SHNUM);
   const e_shstrndx = readU16(elf, E_SHSTRNDX);
   if (
-    e_shentsize !== 64 ||
+    e_shentsize < 64 ||
     e_shoff === 0 ||
     e_shnum === 0 ||
     e_shstrndx >= e_shnum
@@ -100,24 +103,25 @@ function parseElfHeader(elf) {
   }
   if (
     e_shoff > elf.length ||
-    e_shnum > Math.floor((elf.length - e_shoff) / 64)
+    e_shnum > Math.floor((elf.length - e_shoff) / e_shentsize)
   ) {
     throw new Error("section header table out of bounds");
   }
-  return { e_shoff, e_shnum, e_shstrndx };
+  return { e_shoff, e_shentsize, e_shnum, e_shstrndx };
 }
 
-function findSectionByName(elf, e_shoff, e_shnum, e_shstrndx, name) {
-  // 在 SHT 中按名字找段 (只读预检). 返回段条目偏移, 未找到返回 -1.
+function findSectionByName(elf, e_shoff, e_shentsize, e_shnum, e_shstrndx, name) {
+  // 在 SHT 中按名字找段 (只读预检). 段条目按实际 e_shentsize 步进.
+  // 返回段条目偏移, 未找到返回 -1.
   const name_len = name.length;
-  const shstr_e = e_shoff + e_shstrndx * 64;
+  const shstr_e = e_shoff + e_shstrndx * e_shentsize;
   const shstr_off = readU64(elf, shstr_e + 24);
   const shstr_sz = readU64(elf, shstr_e + 32);
   if (shstr_off > elf.length || shstr_sz > elf.length - shstr_off) {
     return -1;
   }
   for (let i = 0; i < e_shnum; i++) {
-    const e = e_shoff + i * 64;
+    const e = e_shoff + i * e_shentsize;
     const name_off = readU32(elf, e);
     if (name_off + name_len <= shstr_sz) {
       const start = shstr_off + name_off;
@@ -131,9 +135,16 @@ function findSectionByName(elf, e_shoff, e_shnum, e_shstrndx, name) {
 
 function hasCodesignSection(elf) {
   try {
-    const { e_shoff, e_shnum, e_shstrndx } = parseElfHeader(elf);
+    const { e_shoff, e_shentsize, e_shnum, e_shstrndx } = parseElfHeader(elf);
     return (
-      findSectionByName(elf, e_shoff, e_shnum, e_shstrndx, CODESIGN_NAME) >= 0
+      findSectionByName(
+        elf,
+        e_shoff,
+        e_shentsize,
+        e_shnum,
+        e_shstrndx,
+        CODESIGN_NAME,
+      ) >= 0
     );
   } catch (e) {
     return false;
@@ -147,11 +158,12 @@ function newShstrndx(old_shstrndx, cs_idx) {
 function stripCodesign(buf) {
   // 剥离 .codesign 段. 返回 {removed, out}.
   const elf = Buffer.from(buf);
-  const { e_shoff, e_shnum, e_shstrndx } = parseElfHeader(elf);
+  const { e_shoff, e_shentsize, e_shnum, e_shstrndx } = parseElfHeader(elf);
 
   const cs_entry_off = findSectionByName(
     elf,
     e_shoff,
+    e_shentsize,
     e_shnum,
     e_shstrndx,
     CODESIGN_NAME,
@@ -159,9 +171,9 @@ function stripCodesign(buf) {
   if (cs_entry_off < 0) {
     return { removed: false, out: elf };
   }
-  const cs_idx = (cs_entry_off - e_shoff) / 64;
+  const cs_idx = (cs_entry_off - e_shoff) / e_shentsize;
 
-  const shstr_e = e_shoff + e_shstrndx * 64;
+  const shstr_e = e_shoff + e_shstrndx * e_shentsize;
   const shstr_off = readU64(elf, shstr_e + 24);
   const shstr_sz = readU64(elf, shstr_e + 32);
   if (shstr_off > elf.length || shstr_sz > elf.length - shstr_off) {
@@ -179,15 +191,15 @@ function stripCodesign(buf) {
   }
   const newShstrTrimmed = newShstr.slice(0, newShstrSz);
 
-  // 3. 新 SHT = 旧 SHT 去掉 cs_idx 条目
+  // 3. 新 SHT = 旧 SHT 去掉 cs_idx 条目 (条目不压缩, 按原 e_shentsize 保留)
   const newShnum = e_shnum - 1;
-  const newSht = Buffer.alloc(newShnum * 64);
+  const newSht = Buffer.alloc(newShnum * e_shentsize);
   let dst = 0;
   for (let i = 0; i < e_shnum; i++) {
     if (i === cs_idx) continue;
-    const e = e_shoff + i * 64;
-    elf.copy(newSht, dst, e, e + 64);
-    dst += 64;
+    const e = e_shoff + i * e_shentsize;
+    elf.copy(newSht, dst, e, e + e_shentsize);
+    dst += e_shentsize;
   }
 
   // 4. 截断到 .codesign 段文件偏移, 依次追加 新shstrtab / 8B对齐 新SHT
@@ -195,7 +207,7 @@ function stripCodesign(buf) {
   const keep_len = Math.min(cs_sec_off, elf.length);
   const new_shstr_off = keep_len;
   const new_sht_off = alignUp(new_shstr_off + newShstrSz, 8);
-  const new_total = new_sht_off + newShnum * 64;
+  const new_total = new_sht_off + newShnum * e_shentsize;
 
   const out = Buffer.alloc(new_total);
   elf.copy(out, 0, 0, keep_len);
@@ -203,13 +215,13 @@ function stripCodesign(buf) {
   newSht.copy(out, new_sht_off);
 
   // 5. 重写 shstrtab 条目
-  const shstr_entry_off_in_new = newShstrndx(e_shstrndx, cs_idx) * 64;
+  const shstr_entry_off_in_new = newShstrndx(e_shstrndx, cs_idx) * e_shentsize;
   writeU64(out, new_sht_off + shstr_entry_off_in_new + 24, new_shstr_off);
   writeU64(out, new_sht_off + shstr_entry_off_in_new + 32, newShstrSz);
 
   // 6. 所有 sh_name > cs_name_off 的段名偏移整体前移 cs_name_len
   for (let i = 0; i < newShnum; i++) {
-    const e = new_sht_off + i * 64;
+    const e = new_sht_off + i * e_shentsize;
     const noff = readU32(out, e);
     if (noff > cs_name_off) writeU32(out, e, noff - cs_name_len);
   }
@@ -225,9 +237,9 @@ function stripCodesign(buf) {
 // ─────────────────── 签名必需的算法核心 ───────────────────
 function injectCodesignSection(elf) {
   // 注入 4KB 占位 .codesign 段. 返回 {out, cs_off}.
-  const { e_shoff, e_shnum, e_shstrndx } = parseElfHeader(elf);
+  const { e_shoff, e_shentsize, e_shnum, e_shstrndx } = parseElfHeader(elf);
 
-  const shstr_e = e_shoff + e_shstrndx * 64;
+  const shstr_e = e_shoff + e_shstrndx * e_shentsize;
   const shstr_off = readU64(elf, shstr_e + 24);
   const shstr_sz = readU64(elf, shstr_e + 32);
   if (shstr_off > elf.length || shstr_sz > elf.length - shstr_off) {
@@ -236,9 +248,9 @@ function injectCodesignSection(elf) {
 
   // 1. cur_end: SHT 末尾与各段 off+sz 的最大值 (SHT_NOBITS=8 不占文件),
   // 且不小于文件实际长度 (段表之后可能拖着附加数据)
-  let cur_end = e_shoff + e_shnum * 64;
+  let cur_end = e_shoff + e_shnum * e_shentsize;
   for (let i = 0; i < e_shnum; i++) {
-    const e = e_shoff + i * 64;
+    const e = e_shoff + i * e_shentsize;
     const sh_type = readU32(elf, e + 4);
     const off = readU64(elf, e + 24);
     const sz = sh_type === 8 ? 0 : readU64(elf, e + 32);
@@ -259,7 +271,7 @@ function injectCodesignSection(elf) {
   const new_shstr_off = cs_off + PAGE_SIZE;
   const new_sht_off = alignUp(new_shstr_off + new_shstr_sz, 8);
   const new_shnum = e_shnum + 1;
-  const new_total = new_sht_off + new_shnum * 64;
+  const new_total = new_sht_off + new_shnum * e_shentsize;
 
   const buf = Buffer.alloc(new_total);
   // 4. 拷贝原内容: 只拷到 cs_off
@@ -267,10 +279,10 @@ function injectCodesignSection(elf) {
   elf.copy(buf, 0, 0, copy_len);
 
   newShstr.copy(buf, new_shstr_off);
-  elf.copy(buf, new_sht_off, e_shoff, e_shoff + e_shnum * 64);
+  elf.copy(buf, new_sht_off, e_shoff, e_shoff + e_shnum * e_shentsize);
 
-  // .codesign 段条目 (64B)
-  const cs_e = new_sht_off + e_shnum * 64;
+  // .codesign 段条目 (前 64B 为标准字段, 超出 64B 的扩展部分保持 0)
+  const cs_e = new_sht_off + e_shnum * e_shentsize;
   writeU32(buf, cs_e + 0, cs_shname); // sh_name
   writeU32(buf, cs_e + 4, 1); // sh_type = SHT_PROGBITS
   writeU64(buf, cs_e + 24, cs_off); // sh_offset
@@ -278,7 +290,7 @@ function injectCodesignSection(elf) {
   writeU64(buf, cs_e + 48, PAGE_SIZE); // sh_addralign
 
   // 更新 shstrtab 条目偏移/大小
-  const shstr_e_new = new_sht_off + e_shstrndx * 64;
+  const shstr_e_new = new_sht_off + e_shstrndx * e_shentsize;
   writeU64(buf, shstr_e_new + 24, new_shstr_off);
   writeU64(buf, shstr_e_new + 32, new_shstr_sz);
 

@@ -84,15 +84,17 @@ def align_up(v: int, a: int) -> int:
 
 
 # ─────────────────── ELF 预清洗/标准化 (非签名必需) ───────────────────
-def parse_elf_header(elf: bytes) -> tuple[int, int, int]:
+def parse_elf_header(elf: bytes) -> tuple[int, int, int, int]:
     """校验并解析 ELF64 header (只读预检).
 
     这不是签名算法的一部分, 而是签名/剥离共用的"先决条件检查":
     - 校验魔数 \\x7fELF + ELFCLASS64
-    - 校验 e_shentsize == 64 (必须为 64; 旧版漏掉此项)
+    - 校验 e_shentsize >= 64 (ELF64 允许段表条目大于 64 字节以携带扩展
+      字段, 故只拒绝小于 64 的; 实际条目大小随返回值传出, 后续所有
+      SHT 遍历/越界校验均按它步进)
     - 校验 SHT 不越界, e_shstrndx < e_shnum
 
-    返回 (e_shoff, e_shnum, e_shstrndx); 非法输入抛 ValueError.
+    返回 (e_shoff, e_shentsize, e_shnum, e_shstrndx); 非法输入抛 ValueError.
     """
     if len(elf) < 64 or elf[:4] != b"\x7fELF" or elf[4] != 2:
         raise ValueError("not ELF64")
@@ -100,27 +102,27 @@ def parse_elf_header(elf: bytes) -> tuple[int, int, int]:
     e_shentsize = read_u16(elf, E_SHENTSIZE)
     e_shnum = read_u16(elf, E_SHNUM)
     e_shstrndx = read_u16(elf, E_SHSTRNDX)
-    if e_shentsize != 64 or e_shoff == 0 or e_shnum == 0 or e_shstrndx >= e_shnum:
+    if e_shentsize < 64 or e_shoff == 0 or e_shnum == 0 or e_shstrndx >= e_shnum:
         raise ValueError("ELF has no usable section header table")
-    if e_shoff > len(elf) or e_shnum > (len(elf) - e_shoff) // 64:
+    if e_shoff > len(elf) or e_shnum > (len(elf) - e_shoff) // e_shentsize:
         raise ValueError("section header table out of bounds")
-    return e_shoff, e_shnum, e_shstrndx
+    return e_shoff, e_shentsize, e_shnum, e_shstrndx
 
 
-def find_section_by_name(elf: bytes, e_shoff: int, e_shnum: int,
-                         e_shstrndx: int, name: bytes) -> int:
-    """在 SHT 中按名字找段 (只读预检).
+def find_section_by_name(elf: bytes, e_shoff: int, e_shentsize: int,
+                         e_shnum: int, e_shstrndx: int, name: bytes) -> int:
+    """在 SHT 中按名字找段 (只读预检). 段条目按实际 e_shentsize 步进.
 
-    返回段条目在文件中的偏移 (即 e_shoff + idx*64), 未找到返回 -1.
+    返回段条目在文件中的偏移 (即 e_shoff + idx*e_shentsize), 未找到返回 -1.
     """
     name_len = len(name)
-    shstr_e = e_shoff + e_shstrndx * 64
+    shstr_e = e_shoff + e_shstrndx * e_shentsize
     shstr_off = read_u64(elf, shstr_e + 24)
     shstr_sz = read_u64(elf, shstr_e + 32)
     if shstr_off + shstr_sz > len(elf):
         return -1
     for i in range(e_shnum):
-        e = e_shoff + i * 64
+        e = e_shoff + i * e_shentsize
         name_off = read_u32(elf, e)
         if name_off + name_len <= shstr_sz:
             if elf[shstr_off + name_off: shstr_off + name_off + name_len] == name:
@@ -136,10 +138,10 @@ def has_codesign_section(elf: bytes) -> bool:
     - --force 模式: 已含则先走 strip_codesign 再签
     """
     try:
-        e_shoff, e_shnum, e_shstrndx = parse_elf_header(elf)
+        e_shoff, e_shentsize, e_shnum, e_shstrndx = parse_elf_header(elf)
     except ValueError:
         return False
-    return find_section_by_name(elf, e_shoff, e_shnum, e_shstrndx,
+    return find_section_by_name(elf, e_shoff, e_shentsize, e_shnum, e_shstrndx,
                                 CODESIGN_NAME) >= 0
 
 
@@ -159,7 +161,7 @@ def strip_codesign(buf: bytearray) -> tuple[bool, bytearray]:
     剥离步骤:
       1. 定位 .codesign 段条目 → cs_idx
       2. 从 shstrtab 中 drain 掉 ".codesign\\0" (cs_name_off .. +10)
-      3. 新 SHT = 旧 SHT 去掉 cs_idx 条目
+      3. 新 SHT = 旧 SHT 去掉 cs_idx 条目 (条目不压缩, 按原 e_shentsize 保留)
       4. 文件截断到 cs_sec_off (段在文件中的偏移), 其后依次放新 shstrtab、
          8B 对齐的新 SHT
       5. 重写 shstrtab 条目偏移/大小 (注意 cs_idx 在 shstrtab 前后时索引调整)
@@ -169,15 +171,16 @@ def strip_codesign(buf: bytearray) -> tuple[bool, bytearray]:
     返回 (removed, new_bytes); removed 为 False 表示本来就没有 .codesign.
     """
     elf = bytes(buf)
-    e_shoff, e_shnum, e_shstrndx = parse_elf_header(elf)
+    e_shoff, e_shentsize, e_shnum, e_shstrndx = parse_elf_header(elf)
 
-    cs_entry_off = find_section_by_name(elf, e_shoff, e_shnum, e_shstrndx, CODESIGN_NAME)
+    cs_entry_off = find_section_by_name(elf, e_shoff, e_shentsize, e_shnum,
+                                        e_shstrndx, CODESIGN_NAME)
     if cs_entry_off < 0:
         return False, bytearray(elf)
-    cs_idx = (cs_entry_off - e_shoff) // 64
+    cs_idx = (cs_entry_off - e_shoff) // e_shentsize
 
     # 读 shstrtab 位置并做越界检查
-    shstr_e = e_shoff + e_shstrndx * 64
+    shstr_e = e_shoff + e_shstrndx * e_shentsize
     shstr_off = read_u64(elf, shstr_e + 24)
     shstr_sz = read_u64(elf, shstr_e + 32)
     if shstr_off + shstr_sz > len(elf):
@@ -191,35 +194,35 @@ def strip_codesign(buf: bytearray) -> tuple[bool, bytearray]:
         del new_shstr[cs_name_off: cs_name_off + cs_name_len]
     new_shstr_sz = len(new_shstr)
 
-    # 3. 新 SHT = 旧 SHT 去掉 cs_idx 条目
+    # 3. 新 SHT = 旧 SHT 去掉 cs_idx 条目 (每条目按 e_shentsize 字节原样拷贝)
     new_shnum = e_shnum - 1
     new_sht = bytearray()
     for i in range(e_shnum):
         if i == cs_idx:
             continue
-        e = e_shoff + i * 64
-        new_sht += elf[e: e + 64]
+        e = e_shoff + i * e_shentsize
+        new_sht += elf[e: e + e_shentsize]
 
     # 4. 截断到 .codesign 段文件偏移, 依次追加 新shstrtab / 8B对齐 新SHT
     cs_sec_off = read_u64(elf, cs_entry_off + 24)
     keep_len = min(cs_sec_off, len(elf))
     new_shstr_off = keep_len
     new_sht_off = align_up(new_shstr_off + new_shstr_sz, 8)
-    new_total = new_sht_off + new_shnum * 64
+    new_total = new_sht_off + new_shnum * e_shentsize
 
     out = bytearray(new_total)
     out[0:keep_len] = elf[0:keep_len]
     out[new_shstr_off: new_shstr_off + new_shstr_sz] = new_shstr
-    out[new_sht_off: new_sht_off + new_shnum * 64] = new_sht
+    out[new_sht_off: new_sht_off + new_shnum * e_shentsize] = new_sht
 
     # 5. 重写 shstrtab 条目: 新 shstr 位置/大小 (cs_idx 在 shstrtab 前后时索引不同)
-    shstr_entry_off_in_new = _new_shstrndx(e_shstrndx, cs_idx) * 64
+    shstr_entry_off_in_new = _new_shstrndx(e_shstrndx, cs_idx) * e_shentsize
     write_u64(out, new_sht_off + shstr_entry_off_in_new + 24, new_shstr_off)
     write_u64(out, new_sht_off + shstr_entry_off_in_new + 32, new_shstr_sz)
 
     # 6. 所有 sh_name > cs_name_off 的段名偏移整体前移 cs_name_len
     for i in range(new_shnum):
-        e = new_sht_off + i * 64
+        e = new_sht_off + i * e_shentsize
         noff = read_u32(out, e)
         if noff > cs_name_off:
             write_u32(out, e, noff - cs_name_len)
@@ -238,11 +241,14 @@ def inject_codesign_section(elf: bytes) -> tuple[bytes, int]:
     """注入 4KB 占位 .codesign 段 (签名第一步).
 
     这是签名算法的必要组成部分, 流程如下:
-      1. 计算所有段末尾的最大值 cur_end = max(e_shoff+e_shnum*64, 各段 off+sz
-         [SHT_NOBITS 不计], 文件实际长度), 段文件偏移 cs_off = align_up(cur_end, 4096)
+      1. 计算所有段末尾的最大值 cur_end = max(e_shoff+e_shnum*e_shentsize,
+         各段 off+sz [SHT_NOBITS 不计], 文件实际长度), 段文件偏移
+         cs_off = align_up(cur_end, 4096)
       2. 新 shstrtab = 旧 + ".codesign\\0"; 落位 cs_off+4096
-      3. 新 SHT 落位新 shstrtab 之后 (8B 对齐), 复制旧 SHT, 追加 .codesign 条目
-         (sh_type=SHT_PROGBITS, sh_offset=cs_off, sh_size=4096, sh_addralign=4096)
+      3. 新 SHT 落位新 shstrtab 之后 (8B 对齐), 按原 e_shentsize 复制旧 SHT,
+         追加 .codesign 条目 (条目前 64B 是标准字段: sh_type=SHT_PROGBITS,
+         sh_offset=cs_off, sh_size=4096, sh_addralign=4096; 超出 64B 的
+         扩展部分保持 0)
       4. 更新 shstrtab 条目偏移/大小, 更新 header e_shoff/e_shnum (e_shstrndx 不变)
 
     关键差异: 只拷贝 [0, min(len(elf), cs_off)) 的原始内容, cs_off 之后到
@@ -251,10 +257,10 @@ def inject_codesign_section(elf: bytes) -> tuple[bytes, int]:
 
     返回 (含段产物, 段文件偏移).
     """
-    e_shoff, e_shnum, e_shstrndx = parse_elf_header(elf)
+    e_shoff, e_shentsize, e_shnum, e_shstrndx = parse_elf_header(elf)
 
     # shstrtab entry (用于取旧 shstr 内容)
-    shstr_e = e_shoff + e_shstrndx * 64
+    shstr_e = e_shoff + e_shstrndx * e_shentsize
     shstr_off = read_u64(elf, shstr_e + 24)
     shstr_sz = read_u64(elf, shstr_e + 32)
     if shstr_off + shstr_sz > len(elf):
@@ -262,9 +268,9 @@ def inject_codesign_section(elf: bytes) -> tuple[bytes, int]:
 
     # 1. cur_end: SHT 末尾与各段 off+sz 的最大值 (SHT_NOBITS=8 不占文件),
     # 且不小于文件实际长度 (段表之后可能拖着附加数据)
-    cur_end = e_shoff + e_shnum * 64
+    cur_end = e_shoff + e_shnum * e_shentsize
     for i in range(e_shnum):
-        e = e_shoff + i * 64
+        e = e_shoff + i * e_shentsize
         sh_type = read_u32(elf, e + 4)
         off = read_u64(elf, e + 24)
         sz = 0 if sh_type == 8 else read_u64(elf, e + 32)
@@ -284,7 +290,7 @@ def inject_codesign_section(elf: bytes) -> tuple[bytes, int]:
     new_shstr_off = cs_off + PAGE_SIZE
     new_sht_off = align_up(new_shstr_off + new_shstr_sz, 8)
     new_shnum = e_shnum + 1
-    new_total = new_sht_off + new_shnum * 64
+    new_total = new_sht_off + new_shnum * e_shentsize
 
     buf = bytearray(new_total)
     # 4. 拷贝原内容: 只拷到 cs_off
@@ -293,10 +299,11 @@ def inject_codesign_section(elf: bytes) -> tuple[bytes, int]:
     # cs_off..cs_off+4096 为段占位 (bytearray 初始全 0), 稍后写入 payload
 
     buf[new_shstr_off: new_shstr_off + new_shstr_sz] = new_shstr
-    buf[new_sht_off: new_sht_off + e_shnum * 64] = elf[e_shoff: e_shoff + e_shnum * 64]
+    buf[new_sht_off: new_sht_off + e_shnum * e_shentsize] = \
+        elf[e_shoff: e_shoff + e_shnum * e_shentsize]
 
-    # .codesign 段条目 (64B)
-    cs_e = new_sht_off + e_shnum * 64
+    # .codesign 段条目 (前 64B 为标准字段, 超出 64B 的扩展部分保持 0)
+    cs_e = new_sht_off + e_shnum * e_shentsize
     write_u32(buf, cs_e + 0, cs_shname)            # sh_name
     write_u32(buf, cs_e + 4, 1)                    # sh_type = SHT_PROGBITS
     # sh_flags/sh_addr 保持 0
@@ -307,7 +314,7 @@ def inject_codesign_section(elf: bytes) -> tuple[bytes, int]:
     # sh_entsize 保持 0
 
     # 更新 shstrtab 条目偏移/大小 (在新 SHT 中的索引仍为 e_shstrndx)
-    shstr_e_new = new_sht_off + e_shstrndx * 64
+    shstr_e_new = new_sht_off + e_shstrndx * e_shentsize
     write_u64(buf, shstr_e_new + 24, new_shstr_off)
     write_u64(buf, shstr_e_new + 32, new_shstr_sz)
 
