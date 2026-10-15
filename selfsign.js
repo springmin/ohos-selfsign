@@ -203,9 +203,18 @@ function stripCodesign(buf) {
     dst += e_shentsize;
   }
 
-  // 4. 截断到 .codesign 段文件偏移, 依次追加 新shstrtab / 8B对齐 新SHT
+  // 4. 新表落位: 若 .codesign 段数据之后恰好只有旧 shstrtab 与旧 SHT
+  //    (即本工具自己签出的布局), 照旧截断到段偏移并在原位重建, 文件不膨胀;
+  //    否则 (如签名后又被 patchelf 等工具重排过, 段数据之后仍有活跃内容,
+  //    例如被挪到文件尾部新增段的 .interp) 不截断, 新表追加到文件末尾,
+  //    原段数据成为无引用的死字节.
   const cs_sec_off = readU64(elf, cs_entry_off + 24);
-  const keep_len = Math.min(cs_sec_off, elf.length);
+  const compact =
+    cs_sec_off <= elf.length &&
+    cs_sec_off + PAGE_SIZE === shstr_off &&
+    e_shoff === alignUp(shstr_off + shstr_sz, 8) &&
+    elf.length === e_shoff + e_shnum * e_shentsize;
+  const keep_len = compact ? cs_sec_off : elf.length;
   const new_shstr_off = keep_len;
   const new_sht_off = alignUp(new_shstr_off + newShstrSz, 8);
   const new_total = new_sht_off + newShnum * e_shentsize;

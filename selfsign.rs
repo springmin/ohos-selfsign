@@ -320,9 +320,17 @@ fn strip_codesign(buf: &[u8]) -> Result<(bool, Vec<u8>), String> {
         new_sht.extend_from_slice(&elf[e..e + shentsize]);
     }
 
-    // 4. 截断到 .codesign 段文件偏移, 依次追加 新shstrtab / 8B对齐 新SHT
+    // 4. 新表落位: 若 .codesign 段数据之后恰好只有旧 shstrtab 与旧 SHT
+    //    (即本工具自己签出的布局), 照旧截断到段偏移并在原位重建, 文件不膨胀;
+    //    否则 (如签名后又被 patchelf 等工具重排过, 段数据之后仍有活跃内容,
+    //    例如被挪到文件尾部新增段的 .interp) 不截断, 新表追加到文件末尾,
+    //    原段数据成为无引用的死字节.
     let cs_sec_off = read_u64(&elf, cs_entry_off as usize + 24);
-    let keep_len = (cs_sec_off as usize).min(elf.len());
+    let compact = cs_sec_off <= elf.len() as u64
+        && cs_sec_off + PAGE_SIZE as u64 == shstr_off
+        && e_shoff == align_up(shstr_off + shstr_sz, 8)
+        && elf.len() as u64 == e_shoff + (e_shnum as u64) * (e_shentsize as u64);
+    let keep_len = if compact { cs_sec_off as usize } else { elf.len() };
     let new_shstr_off = keep_len;
     let new_sht_off = align_up((new_shstr_off + new_shstr_sz) as u64, 8) as usize;
     let new_total = new_sht_off + new_shnum as usize * shentsize;

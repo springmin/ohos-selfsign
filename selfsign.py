@@ -164,8 +164,8 @@ def strip_codesign(buf: bytearray) -> tuple[bool, bytearray]:
       1. 定位 .codesign 段条目 → cs_idx
       2. 从 shstrtab 中 drain 掉 ".codesign\\0" (cs_name_off .. +10)
       3. 新 SHT = 旧 SHT 去掉 cs_idx 条目 (条目不压缩, 按原 e_shentsize 保留)
-      4. 文件截断到 cs_sec_off (段在文件中的偏移), 其后依次放新 shstrtab、
-         8B 对齐的新 SHT
+      4. 新表落位: 段数据之后恰好只有旧表时照旧截断原位重建; 否则保留全部
+         内容, 新 shstrtab 与 8B 对齐的新 SHT 追加到文件末尾
       5. 重写 shstrtab 条目偏移/大小 (注意 cs_idx 在 shstrtab 前后时索引调整)
       6. 所有 sh_name > cs_name_off 的段名偏移整体前移 cs_name_len
       7. 更新 header: e_shoff / e_shnum / e_shstrndx (仅 cs_idx < e_shstrndx 时 -1)
@@ -205,9 +205,17 @@ def strip_codesign(buf: bytearray) -> tuple[bool, bytearray]:
         e = e_shoff + i * e_shentsize
         new_sht += elf[e: e + e_shentsize]
 
-    # 4. 截断到 .codesign 段文件偏移, 依次追加 新shstrtab / 8B对齐 新SHT
+    # 4. 新表落位: 若 .codesign 段数据之后恰好只有旧 shstrtab 与旧 SHT
+    #    (即本工具自己签出的布局), 照旧截断到段偏移并在原位重建, 文件不膨胀;
+    #    否则 (如签名后又被 patchelf 等工具重排过, 段数据之后仍有活跃内容,
+    #    例如被挪到文件尾部新增段的 .interp) 不截断, 新表追加到文件末尾,
+    #    原段数据成为无引用的死字节.
     cs_sec_off = read_u64(elf, cs_entry_off + 24)
-    keep_len = min(cs_sec_off, len(elf))
+    compact = (cs_sec_off <= len(elf)
+               and cs_sec_off + PAGE_SIZE == shstr_off
+               and e_shoff == align_up(shstr_off + shstr_sz, 8)
+               and len(elf) == e_shoff + e_shnum * e_shentsize)
+    keep_len = cs_sec_off if compact else len(elf)
     new_shstr_off = keep_len
     new_sht_off = align_up(new_shstr_off + new_shstr_sz, 8)
     new_total = new_sht_off + new_shnum * e_shentsize

@@ -301,8 +301,8 @@ static uint16_t new_shstrndx(uint16_t old_shstrndx, size_t cs_idx) {
  *   1. 定位 .codesign 段条目 → cs_idx
  *   2. 从 shstrtab 中 drain 掉 ".codesign\0" (cs_name_off .. +10)
  *   3. 新 SHT = 旧 SHT 去掉 cs_idx 条目 (条目不压缩, 按原 e_shentsize 保留)
- *   4. 文件截断到 cs_sec_off (段在文件中的偏移), 其后依次放新 shstrtab、
- *      8B 对齐的新 SHT
+ *   4. 新表落位: 段数据之后恰好只有旧表时照旧截断原位重建; 否则保留全部
+ *      内容, 新 shstrtab 与 8B 对齐的新 SHT 追加到文件末尾
  *   5. 重写 shstrtab 条目偏移/大小 (注意 cs_idx 在 shstrtab 前后时索引调整)
  *   6. 所有 sh_name > cs_name_off 的段名偏移整体前移 cs_name_len
  *   7. 更新 header: e_shoff / e_shnum / e_shstrndx (仅 cs_idx < e_shstrndx 时 -1)
@@ -355,16 +355,24 @@ int strip_codesign(uint8_t **buf, size_t *buf_len) {
         dst += e_shentsize;
     }
 
-    /* 4. 截断到 .codesign 段文件偏移, 依次追加 新shstrtab / 8B对齐 新SHT */
+    /* 4. 新表落位: 若 .codesign 段数据之后恰好只有旧 shstrtab 与旧 SHT
+       (即本工具自己签出的布局), 照旧截断到段偏移并在原位重建, 文件不膨胀;
+       否则 (如签名后又被 patchelf 等工具重排过, 段数据之后仍有活跃内容,
+       例如被挪到文件尾部新增段的 .interp) 不截断, 新表追加到文件末尾,
+       原段数据成为无引用的死字节. */
     size_t cs_sec_off = (size_t)read_u64(elf, elf_len, (size_t)cs_entry_off + 24);
-    size_t keep_len = cs_sec_off < elf_len ? cs_sec_off : elf_len;
+    int compact = cs_sec_off <= elf_len
+                  && (size_t)cs_sec_off + PAGE_SIZE == shstr_off
+                  && (size_t)e_shoff == (size_t)align_up(shstr_off + shstr_sz, 8)
+                  && elf_len == (size_t)e_shoff + (size_t)e_shnum * e_shentsize;
+    size_t keep_len = compact ? (size_t)cs_sec_off : elf_len;
     size_t new_shstr_off = keep_len;
     size_t new_sht_off = (size_t)align_up(new_shstr_off + new_shstr_sz, 8);
     size_t new_total = new_sht_off + new_sht_bytes;
 
     uint8_t *out = calloc(1, new_total ? new_total : 1);
     if (!out) { free(new_shstr); free(new_sht); fprintf(stderr, "error: out of memory\n"); return -1; }
-    if (keep_len) memcpy(out, elf, keep_len);
+    memcpy(out, elf, keep_len);
     memcpy(out + new_shstr_off, new_shstr, new_shstr_sz);
     memcpy(out + new_sht_off, new_sht, new_sht_bytes);
     free(new_shstr);

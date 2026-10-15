@@ -180,11 +180,19 @@ func stripCodesign(buf []byte) (bool, []byte, error) {
 		newSht = append(newSht, elf[e:e+shentsize]...)
 	}
 
-	// 4. 截断到 .codesign 段文件偏移, 依次追加 新shstrtab / 8B对齐 新SHT
+	// 4. 新表落位: 若 .codesign 段数据之后恰好只有旧 shstrtab 与旧 SHT
+	//    (即本工具自己签出的布局), 照旧截断到段偏移并在原位重建, 文件不膨胀;
+	//    否则 (如签名后又被 patchelf 等工具重排过, 段数据之后仍有活跃内容,
+	//    例如被挪到文件尾部新增段的 .interp) 不截断, 新表追加到文件末尾,
+	//    原段数据成为无引用的死字节.
 	csSecOff := readU64(elf, int(csEntryOff)+24)
-	keepLen := int(csSecOff)
-	if keepLen > len(elf) {
-		keepLen = len(elf)
+	compact := csSecOff <= uint64(len(elf)) &&
+		csSecOff+pageSize == shstrOff &&
+		h.eShOff == alignUp(shstrOff+shstrSz, 8) &&
+		uint64(len(elf)) == h.eShOff+uint64(h.eShNum)*uint64(shentsize)
+	keepLen := len(elf)
+	if compact {
+		keepLen = int(csSecOff)
 	}
 	newShstrOff := keepLen
 	newShtOff := int(alignUp(uint64(newShstrOff+newShstrSz), 8))
